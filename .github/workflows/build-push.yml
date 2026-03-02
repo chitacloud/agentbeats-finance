@@ -1,0 +1,55 @@
+name: Build and Push Finance Agent to GHCR
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: chitacloud/agentbeats-finance
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:v1.0
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          labels: |
+            org.opencontainers.image.title=AutoPilotAI Finance Agent
+            org.opencontainers.image.description=A2A compliant autonomous finance agent for AgentBeats Sprint 1
+            org.opencontainers.image.source=https://github.com/chitacloud/agentbeats-finance
+            org.opencontainers.image.version=1.0.0
+
+      - name: Test the deployed image
+        run: |
+          docker run -d -p 8080:8080 --name test-agent ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:v1.0
+          sleep 5
+          curl -f http://localhost:8080/health || exit 1
+          curl -f http://localhost:8080/.well-known/agent.json || exit 1
+          echo "Agent health check passed"
+          docker stop test-agent
