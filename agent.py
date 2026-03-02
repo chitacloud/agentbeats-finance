@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-AutoPilotAI Finance Agent v2.0 - AgentBeats Sprint 1 Entry
+AutoPilotAI Finance Agent v3.0 - AgentBeats Sprint 1 Entry
 FinanceBench-compatible A2A compliant autonomous finance agent.
 
-Supports:
-- /a2a/generate (green agent evaluation endpoint)
-- /.well-known/agent.json (A2A agent card)
-- /health (health check)
-- / (A2A JSON-RPC fallback)
+Supports the FinanceBench evaluation benchmark:
+- 537 questions on SEC 10-K/10-Q/earnings reports
+- Categories: quantitative retrieval, numerical reasoning, GAAP adjustments,
+  beat-or-miss, trend analysis, financial modeling, market analysis
 
+A2A Protocol: A2AStarletteApplication (google-a2a compatible)
 Author: Alex Chen (AutoPilotAI) - alexchen.chitacloud.dev
 Competition: AgentBeats Phase 2, Sprint 1 - Finance Track
 """
@@ -19,23 +19,38 @@ import time
 import uuid
 import logging
 import asyncio
+import re
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, AsyncIterable, Union
+
 import urllib.request
 import urllib.parse
 import urllib.error
 
-# Try FastAPI for the proper A2A server
-try:
-    from fastapi import FastAPI, Request
-    from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import JSONResponse
-    import uvicorn
-    HAS_FASTAPI = True
-except ImportError:
-    HAS_FASTAPI = False
+# A2A SDK imports
+from a2a.server.agent_execution import AgentExecutor, RequestContext
+from a2a.server.events import EventQueue
+from a2a.types import (
+    Message,
+    Task,
+    TaskState,
+    TaskStatus,
+    TaskStatusUpdateEvent,
+    TaskArtifactUpdateEvent,
+    Artifact,
+    Part,
+    TextPart,
+    UnsupportedOperationError,
+)
 
-# Try yfinance for financial data
+# Try LiteLLM for LLM-powered answers
+try:
+    from litellm import completion
+    HAS_LITELLM = True
+except ImportError:
+    HAS_LITELLM = False
+
+# Try yfinance for live market data
 try:
     import yfinance as yf
     HAS_YFINANCE = True
@@ -44,13 +59,16 @@ except ImportError:
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s"
 )
 log = logging.getLogger("finance_agent")
 
-AGENT_ID = "autopilotai-finance-v2"
-AGENT_VERSION = "2.0.0"
-PORT = int(os.environ.get("PORT", 8080))
+AGENT_VERSION = "3.0.0"
+
+# LLM configuration from environment
+LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
+LLM_API_KEY = os.environ.get("LLM_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "")
 
 
 # ============================================================
@@ -58,30 +76,35 @@ PORT = int(os.environ.get("PORT", 8080))
 # ============================================================
 
 FINANCIAL_FORMULAS = {
-    "pe_ratio": lambda price, eps: round(price / eps, 2) if eps != 0 else None,
-    "pb_ratio": lambda price, bvps: round(price / bvps, 2) if bvps != 0 else None,
+    "pe_ratio": lambda price, eps: round(price / eps, 2) if eps and eps != 0 else None,
+    "pb_ratio": lambda price, bvps: round(price / bvps, 2) if bvps and bvps != 0 else None,
     "cagr": lambda start, end, years: round(((end / start) ** (1 / years) - 1) * 100, 2),
     "roi": lambda gain, cost: round((gain / cost) * 100, 2),
-    "eps": lambda net_income, shares: round(net_income / shares, 2) if shares != 0 else None,
-    "debt_to_equity": lambda debt, equity: round(debt / equity, 2) if equity != 0 else None,
-    "current_ratio": lambda current_assets, current_liabilities: round(current_assets / current_liabilities, 2),
-    "gross_margin": lambda revenue, cogs: round((revenue - cogs) / revenue * 100, 2),
-    "operating_margin": lambda operating_income, revenue: round(operating_income / revenue * 100, 2),
-    "net_margin": lambda net_income, revenue: round(net_income / revenue * 100, 2),
-    "revenue_growth": lambda current, previous: round((current - previous) / previous * 100, 2),
-    "hhi": lambda weights: round(sum(w**2 for w in weights) * 10000, 0),  # Herfindahl-Hirschman Index
-    "sharpe": lambda returns, risk_free, std: round((returns - risk_free) / std, 2) if std != 0 else None,
-    "var_95": lambda portfolio_value, volatility: round(1.645 * volatility * portfolio_value, 2),
+    "eps": lambda net_income, shares: round(net_income / shares, 2) if shares and shares != 0 else None,
+    "debt_to_equity": lambda debt, equity: round(debt / equity, 2) if equity and equity != 0 else None,
+    "current_ratio": lambda ca, cl: round(ca / cl, 2) if cl and cl != 0 else None,
+    "gross_margin": lambda revenue, cogs: round((revenue - cogs) / revenue * 100, 2) if revenue else None,
+    "operating_margin": lambda oi, rev: round(oi / rev * 100, 2) if rev else None,
+    "net_margin": lambda ni, rev: round(ni / rev * 100, 2) if rev else None,
+    "revenue_growth": lambda curr, prev: round((curr - prev) / prev * 100, 2) if prev else None,
+    "sharpe": lambda ret, rf, std: round((ret - rf) / std, 2) if std and std != 0 else None,
 }
 
-QUESTION_TYPE_HANDLERS = {
-    "Market Analysis": "market_analysis",
-    "Trends": "trends_analysis",
-    "Complex Retrieval": "data_retrieval",
-    "Beat or Miss": "beat_or_miss",
-    "Calculation": "calculation",
-    "Comparison": "comparison",
-    "Summary": "summary",
+TICKER_MAP = {
+    "Netflix": "NFLX", "Apple": "AAPL", "Microsoft": "MSFT", "Google": "GOOGL",
+    "Alphabet": "GOOGL", "Amazon": "AMZN", "Tesla": "TSLA", "Meta": "META",
+    "Facebook": "META", "NVIDIA": "NVDA", "AMD": "AMD", "Intel": "INTC",
+    "JPMorgan": "JPM", "Goldman Sachs": "GS", "Morgan Stanley": "MS",
+    "Bank of America": "BAC", "Citigroup": "C", "Wells Fargo": "WFC",
+    "Walmart": "WMT", "Target": "TGT", "Home Depot": "HD", "Costco": "COST",
+    "Johnson & Johnson": "JNJ", "Pfizer": "PFE", "Moderna": "MRNA",
+    "Exxon": "XOM", "Chevron": "CVX", "Boeing": "BA",
+    "TJX": "TJX", "TJX Companies": "TJX", "BBSI": "BBSI",
+    "Palantir": "PLTR", "Snowflake": "SNOW", "Datadog": "DDOG",
+    "CrowdStrike": "CRWD", "Palo Alto": "PANW",
+    "Berkshire Hathaway": "BRK-B", "Disney": "DIS",
+    "PayPal": "PYPL", "Visa": "V", "Mastercard": "MA",
+    "US Steel": "X", "Lockheed Martin": "LMT",
 }
 
 
@@ -89,17 +112,28 @@ QUESTION_TYPE_HANDLERS = {
 # SEC EDGAR DATA FETCHING
 # ============================================================
 
-def fetch_sec_data(company: str, metric: str = None) -> Optional[Dict]:
-    """Fetch company data from SEC EDGAR."""
+def fetch_sec_filing(company: str, form_type: str = "10-K") -> Optional[Dict]:
+    """Fetch company SEC filing data."""
     try:
-        # Search for company CIK
-        search_url = f"https://efts.sec.gov/LATEST/search-index?q=%22{urllib.parse.quote(company)}%22&dateRange=custom&startdt=2023-01-01&enddt=2025-12-31&forms=10-K,10-Q"
-        req = urllib.request.Request(search_url, headers={"User-Agent": "AutoPilotAI alex-chen@79661d.inboxapi.ai"})
+        search_url = (
+            f"https://efts.sec.gov/LATEST/search-index?q=%22{urllib.parse.quote(company)}%22"
+            f"&dateRange=custom&startdt=2022-01-01&enddt=2025-12-31&forms={form_type}"
+        )
+        req = urllib.request.Request(
+            search_url,
+            headers={"User-Agent": "AutoPilotAI alex-chen@79661d.inboxapi.ai"}
+        )
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read())
             hits = data.get("hits", {}).get("hits", [])
             if hits:
-                return {"source": "SEC EDGAR", "results": len(hits), "company": company}
+                return {
+                    "source": "SEC EDGAR",
+                    "company": company,
+                    "form_type": form_type,
+                    "filings_found": len(hits),
+                    "latest": hits[0].get("_source", {}) if hits else None
+                }
     except Exception as e:
         log.debug(f"SEC EDGAR fetch failed: {e}")
     return None
@@ -112,406 +146,457 @@ def fetch_yfinance_data(ticker: str) -> Optional[Dict]:
     try:
         stock = yf.Ticker(ticker)
         info = stock.info
-        if not info or info.get("regularMarketPrice") is None:
+        if not info:
             return None
         return {
             "ticker": ticker,
+            "company_name": info.get("longName"),
+            "sector": info.get("sector"),
+            "industry": info.get("industry"),
             "price": info.get("regularMarketPrice"),
-            "pe_ratio": info.get("trailingPE"),
-            "forward_pe": info.get("forwardPE"),
-            "eps": info.get("trailingEps"),
             "market_cap": info.get("marketCap"),
             "revenue_ttm": info.get("totalRevenue"),
             "net_income_ttm": info.get("netIncomeToCommon"),
+            "pe_ratio": info.get("trailingPE"),
+            "forward_pe": info.get("forwardPE"),
+            "eps": info.get("trailingEps"),
             "debt_to_equity": info.get("debtToEquity"),
             "current_ratio": info.get("currentRatio"),
             "gross_margins": info.get("grossMargins"),
             "operating_margins": info.get("operatingMargins"),
             "profit_margins": info.get("profitMargins"),
-            "52_week_high": info.get("fiftyTwoWeekHigh"),
-            "52_week_low": info.get("fiftyTwoWeekLow"),
-            "beta": info.get("beta"),
-            "dividend_yield": info.get("dividendYield"),
+            "revenue_growth": info.get("revenueGrowth"),
+            "earnings_growth": info.get("earningsGrowth"),
             "book_value": info.get("bookValue"),
             "price_to_book": info.get("priceToBook"),
             "enterprise_value": info.get("enterpriseValue"),
-            "revenue_growth": info.get("revenueGrowth"),
-            "earnings_growth": info.get("earningsGrowth"),
-            "short_ratio": info.get("shortRatio"),
-            "shares_outstanding": info.get("sharesOutstanding"),
-            "float_shares": info.get("floatShares"),
-            "company_name": info.get("longName"),
-            "sector": info.get("sector"),
-            "industry": info.get("industry"),
+            "beta": info.get("beta"),
+            "dividend_yield": info.get("dividendYield"),
         }
     except Exception as e:
         log.debug(f"yfinance fetch failed for {ticker}: {e}")
     return None
 
 
-def fetch_crypto_price(symbol: str) -> Optional[float]:
-    """Fetch crypto price from CoinGecko."""
-    try:
-        coin_map = {
-            "BTC": "bitcoin", "ETH": "ethereum", "NEAR": "near",
-            "SOL": "solana", "BNB": "binancecoin", "USDC": "usd-coin",
-            "TON": "the-open-network", "LINK": "chainlink",
-            "MATIC": "matic-network", "AVAX": "avalanche-2",
-            "DOT": "polkadot", "ADA": "cardano", "XRP": "ripple",
-        }
-        coin_id = coin_map.get(symbol.upper(), symbol.lower())
-        url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
-        req = urllib.request.Request(url, headers={"Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
-            return data.get(coin_id, {}).get("usd")
-    except Exception:
-        return None
-
-
-# ============================================================
-# TICKER EXTRACTION
-# ============================================================
-
-TICKER_MAP = {
-    "Netflix": "NFLX", "Apple": "AAPL", "Microsoft": "MSFT", "Google": "GOOGL",
-    "Alphabet": "GOOGL", "Amazon": "AMZN", "Tesla": "TSLA", "Meta": "META",
-    "Facebook": "META", "NVIDIA": "NVDA", "AMD": "AMD", "Intel": "INTC",
-    "JPMorgan": "JPM", "Goldman Sachs": "GS", "Morgan Stanley": "MS",
-    "Bank of America": "BAC", "Citigroup": "C", "Wells Fargo": "WFC",
-    "Walmart": "WMT", "Target": "TGT", "Home Depot": "HD", "Costco": "COST",
-    "Johnson & Johnson": "JNJ", "Pfizer": "PFE", "Moderna": "MRNA",
-    "Exxon": "XOM", "Chevron": "CVX", "BP": "BP",
-    "Boeing": "BA", "Lockheed Martin": "LMT", "Raytheon": "RTX",
-    "US Steel": "X", "Nippon Steel": None,
-    "TJX": "TJX", "TJX Companies": "TJX",
-    "BBSI": "BBSI", "Barrett Business Services": "BBSI",
-    "Palantir": "PLTR", "Snowflake": "SNOW", "Datadog": "DDOG",
-    "CrowdStrike": "CRWD", "Palo Alto": "PANW",
-    "Berkshire Hathaway": "BRK-B", "Buffett": "BRK-B",
-    "Disney": "DIS", "Warner Bros": "WBD", "Paramount": "PARA",
-    "AT&T": "T", "Verizon": "VZ", "T-Mobile": "TMUS",
-    "PayPal": "PYPL", "Visa": "V", "Mastercard": "MA", "Square": "SQ",
-}
-
-
-def extract_ticker(question: str) -> Optional[str]:
-    """Extract stock ticker from question."""
-    # Check for explicit NASDAQ/NYSE tickers
-    import re
-    ticker_match = re.search(r'NASDAQ:\s*([A-Z]+)|NYSE:\s*([A-Z]+)|\b([A-Z]{2,5})\b', question)
-    if ticker_match:
-        for group in ticker_match.groups():
-            if group:
-                return group
-
-    # Check for company names
+def extract_ticker(text: str) -> Optional[str]:
+    """Extract stock ticker from text."""
+    # Explicit NASDAQ/NYSE format
+    m = re.search(r'(?:NASDAQ|NYSE):\s*([A-Z]{1,5})\b', text)
+    if m:
+        return m.group(1)
+    # Company name lookup
     for name, ticker in TICKER_MAP.items():
-        if name.lower() in question.lower() and ticker:
+        if name.lower() in text.lower() and ticker:
             return ticker
-
+    # Bare ticker (ALL CAPS, 1-5 chars)
+    m = re.search(r'\b([A-Z]{1,5})\b', text)
+    if m:
+        candidate = m.group(1)
+        # Skip common words
+        if candidate not in {"SEC", "GAAP", "USA", "CEO", "CFO", "Q1", "Q2", "Q3", "Q4",
+                              "YOY", "YTD", "TTM", "EPS", "PE", "ROI", "AI", "ML",
+                              "ARPU", "CAGR", "BPS", "MDA", "IPO", "FY", "EBIT", "EBITDA"}:
+            return candidate
     return None
 
 
 # ============================================================
-# FINANCIAL QUESTION ANALYZER
+# DIRECT CALCULATION ENGINE
 # ============================================================
 
-def analyze_calculation_question(question: str) -> Optional[str]:
-    """Handle explicit calculation questions."""
-    import re
+def try_direct_calculation(question: str) -> Optional[str]:
+    """Handle explicit numerical calculation questions directly."""
     q = question.lower()
 
     # CAGR
-    cagr_match = re.search(r'cagr|compound annual growth', q)
-    if cagr_match:
-        nums = re.findall(r'\$?([\d,]+(?:\.\d+)?)', question)
-        if len(nums) >= 2:
+    if re.search(r'cagr|compound annual growth', q):
+        nums = re.findall(r'\$?([\d,]+(?:\.\d+)?)\s*(?:billion|million|thousand)?', question)
+        years_m = re.search(r'(\d+)\s+years?', q)
+        if len(nums) >= 2 and years_m:
             try:
                 start = float(nums[0].replace(',', ''))
                 end = float(nums[1].replace(',', ''))
-                years_match = re.search(r'(\d+)\s+years?', q)
-                if years_match:
-                    years = int(years_match.group(1))
-                    cagr = FINANCIAL_FORMULAS["cagr"](start, end, years)
-                    return f"The CAGR from ${start:,.0f} to ${end:,.0f} over {years} years is {cagr}%."
+                years = int(years_m.group(1))
+                # Handle billion/million
+                if 'billion' in question[:question.lower().find(nums[1])].lower():
+                    start *= 1e9
+                    end *= 1e9
+                cagr = FINANCIAL_FORMULAS["cagr"](start, end, years)
+                return f"The CAGR is {cagr}% over {years} years (from {nums[0]} to {nums[1]})."
             except Exception:
                 pass
 
     # P/E ratio
-    pe_match = re.search(r'p/?e ratio|price.to.earnings', q)
-    if pe_match:
-        price_match = re.search(r'price of \$?([\d.]+)', q)
-        eps_match = re.search(r'earnings per share of \$?([\d.]+)', q)
-        if price_match and eps_match:
+    if re.search(r'p/?e\s+ratio|price.to.earnings', q):
+        price_m = re.search(r'price.{0,20}\$?([\d.]+)', q)
+        eps_m = re.search(r'(?:eps|earnings per share).{0,20}\$?([\d.]+)', q)
+        if price_m and eps_m:
             try:
-                price = float(price_match.group(1))
-                eps = float(eps_match.group(1))
-                pe = FINANCIAL_FORMULAS["pe_ratio"](price, eps)
-                return f"The P/E ratio is {pe}. (Price ${price} / EPS ${eps} = {pe}x)"
-            except Exception:
-                pass
-
-    # ROI
-    roi_match = re.search(r'\broi\b|return on investment', q)
-    if roi_match:
-        nums = re.findall(r'\$?([\d,]+(?:\.\d+)?)', question)
-        if len(nums) >= 2:
-            try:
-                gain = float(nums[0].replace(',', ''))
-                cost = float(nums[1].replace(',', ''))
-                roi = FINANCIAL_FORMULAS["roi"](gain - cost, cost)
-                return f"The ROI is {roi}%."
+                pe = FINANCIAL_FORMULAS["pe_ratio"](float(price_m.group(1)), float(eps_m.group(1)))
+                if pe:
+                    return f"P/E ratio = {pe}x (Price ${price_m.group(1)} / EPS ${eps_m.group(1)})"
             except Exception:
                 pass
 
     # Gross margin
-    gm_match = re.search(r'gross margin', q)
-    if gm_match:
-        nums = re.findall(r'\$?([\d,]+(?:\.\d+)?)\s*(?:billion|million|thousand)?', question)
+    if re.search(r'gross margin', q):
+        nums = re.findall(r'\$?([\d,]+(?:\.\d+)?)', question)
         if len(nums) >= 2:
             try:
                 revenue = float(nums[0].replace(',', ''))
                 cogs = float(nums[1].replace(',', ''))
-                gm = FINANCIAL_FORMULAS["gross_margin"](revenue, cogs)
-                return f"The gross margin is {gm}%."
+                if revenue > cogs:
+                    gm = FINANCIAL_FORMULAS["gross_margin"](revenue, cogs)
+                    return f"Gross margin = {gm}% (Revenue: {nums[0]}, COGS: {nums[1]})"
+            except Exception:
+                pass
+
+    # Beat or miss with BPS
+    if re.search(r'beat|miss|bps', q):
+        nums = re.findall(r'([\d.]+)\s*(?:%|bps?|basis points?)', question, re.IGNORECASE)
+        if len(nums) >= 2:
+            try:
+                actual = float(nums[0])
+                guidance = float(nums[1])
+                diff = actual - guidance
+                unit = "bps" if re.search(r'bps|basis', q) else "%"
+                direction = "beat" if diff > 0 else "missed"
+                return f"The result {direction} guidance by {abs(diff):.1f}{unit} (actual: {actual}, guidance: {guidance})"
             except Exception:
                 pass
 
     return None
 
 
-def build_financial_answer(question: str, context_data: Dict = None) -> str:
-    """Build a comprehensive financial answer."""
-    import re
-    q_lower = question.lower()
+# ============================================================
+# LLM-POWERED ANSWER ENGINE
+# ============================================================
 
-    # Try direct calculation first
-    calc_answer = analyze_calculation_question(question)
-    if calc_answer:
-        return calc_answer
+def build_llm_prompt(question: str, context: str = "", yf_data: Optional[Dict] = None) -> str:
+    """Build a prompt for the LLM to answer a finance question."""
+    system_context = """You are an expert financial analyst with deep knowledge of:
+- SEC filings (10-K, 10-Q, 8-K, proxy statements)
+- Financial statements (income statement, balance sheet, cash flow)
+- Financial ratios and metrics (P/E, CAGR, margins, ROI, EPS, debt ratios)
+- GAAP vs non-GAAP adjustments
+- Earnings beats/misses and guidance analysis
+- Industry trends and market analysis
+- FinanceBench benchmark questions
 
-    # Check if we have yfinance data
-    ticker = extract_ticker(question)
-    yf_data = None
-    if ticker and HAS_YFINANCE:
-        yf_data = fetch_yfinance_data(ticker)
+Answer the question concisely and accurately. If the question asks for a specific number,
+provide that number with proper units. If asking about a trend, describe it clearly.
+Focus on precision and factual accuracy."""
 
-    # Build answer based on what data we have
-    parts = []
-
+    market_context = ""
     if yf_data:
-        if any(kw in q_lower for kw in ["p/e", "pe ratio", "price to earnings"]):
-            pe = yf_data.get("pe_ratio")
-            if pe:
-                parts.append(f"{yf_data.get('company_name', ticker)} P/E ratio: {pe:.2f}x")
+        fields = []
+        if yf_data.get("company_name"):
+            fields.append(f"Company: {yf_data['company_name']} ({yf_data.get('ticker', '')})")
+        if yf_data.get("revenue_ttm"):
+            fields.append(f"Revenue (TTM): ${yf_data['revenue_ttm']/1e9:.2f}B")
+        if yf_data.get("net_income_ttm"):
+            fields.append(f"Net Income (TTM): ${yf_data['net_income_ttm']/1e9:.2f}B")
+        if yf_data.get("gross_margins"):
+            fields.append(f"Gross Margin: {yf_data['gross_margins']*100:.1f}%")
+        if yf_data.get("operating_margins"):
+            fields.append(f"Operating Margin: {yf_data['operating_margins']*100:.1f}%")
+        if yf_data.get("pe_ratio"):
+            fields.append(f"P/E Ratio: {yf_data['pe_ratio']:.1f}x")
+        if yf_data.get("market_cap"):
+            fields.append(f"Market Cap: ${yf_data['market_cap']/1e9:.1f}B")
+        if yf_data.get("revenue_growth"):
+            fields.append(f"Revenue Growth (YoY): {yf_data['revenue_growth']*100:.1f}%")
+        if fields:
+            market_context = "\n\nLive Market Data:\n" + "\n".join(fields)
 
-        if any(kw in q_lower for kw in ["revenue", "sales"]):
-            rev = yf_data.get("revenue_ttm")
-            if rev:
-                parts.append(f"Revenue (TTM): ${rev/1e9:.2f}B")
-            growth = yf_data.get("revenue_growth")
-            if growth:
-                parts.append(f"Revenue growth: {growth*100:.1f}%")
+    filing_context = f"\n\nFiling Context:\n{context}" if context else ""
 
-        if any(kw in q_lower for kw in ["eps", "earnings per share"]):
-            eps = yf_data.get("eps")
-            if eps:
-                parts.append(f"EPS (TTM): ${eps:.2f}")
+    return f"""{system_context}{market_context}{filing_context}
 
-        if any(kw in q_lower for kw in ["market cap", "market capitalization"]):
-            mc = yf_data.get("market_cap")
-            if mc:
-                parts.append(f"Market cap: ${mc/1e9:.2f}B")
+Question: {question}
 
-        if any(kw in q_lower for kw in ["margin", "profitability"]):
-            gm = yf_data.get("gross_margins")
-            om = yf_data.get("operating_margins")
-            nm = yf_data.get("profit_margins")
-            if gm:
-                parts.append(f"Gross margin: {gm*100:.1f}%")
-            if om:
-                parts.append(f"Operating margin: {om*100:.1f}%")
-            if nm:
-                parts.append(f"Net margin: {nm*100:.1f}%")
-
-        if any(kw in q_lower for kw in ["beta", "volatility"]):
-            beta = yf_data.get("beta")
-            if beta:
-                parts.append(f"Beta: {beta:.2f}")
-
-        if any(kw in q_lower for kw in ["dividend", "yield"]):
-            dy = yf_data.get("dividend_yield")
-            if dy:
-                parts.append(f"Dividend yield: {dy*100:.2f}%")
-
-    if parts:
-        return ". ".join(parts) + "."
-
-    # Generic financial reasoning for complex questions
-    return generate_financial_reasoning(question)
+Answer:"""
 
 
-def generate_financial_reasoning(question: str) -> str:
-    """Generate financial reasoning for complex questions."""
-    import re
-    q_lower = question.lower()
+def get_llm_answer(question: str, context: str = "", yf_data: Optional[Dict] = None) -> str:
+    """Get LLM-powered answer for a financial question."""
+    if not HAS_LITELLM or not LLM_API_KEY:
+        return None
 
-    # Identify question category
-    if any(kw in q_lower for kw in ["merger", "acquisition", "deal", "takeover"]):
-        # M&A questions
-        companies = []
-        for name in TICKER_MAP:
-            if name.lower() in q_lower:
-                companies.append(name)
+    try:
+        prompt = build_llm_prompt(question, context, yf_data)
+
+        kwargs = {
+            "model": LLM_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 512,
+            "temperature": 0.1,
+        }
+
+        if LLM_API_KEY:
+            kwargs["api_key"] = LLM_API_KEY
+        if LLM_BASE_URL:
+            kwargs["base_url"] = LLM_BASE_URL
+            kwargs["api_key"] = LLM_API_KEY or "not-needed"
+
+        response = completion(**kwargs)
+        answer = response.choices[0].message.content.strip()
+        log.info(f"LLM answer generated ({len(answer)} chars)")
+        return answer
+    except Exception as e:
+        log.warning(f"LLM generation failed: {e}")
+        return None
+
+
+# ============================================================
+# RULE-BASED FALLBACK ENGINE
+# ============================================================
+
+def get_rule_based_answer(question: str, yf_data: Optional[Dict] = None) -> str:
+    """Rule-based financial reasoning as fallback."""
+    q = question.lower()
+    ticker = extract_ticker(question)
+
+    # ARPU questions
+    if "arpu" in q or "average revenue per user" in q:
+        company = yf_data.get("company_name", ticker or "the company") if yf_data else (ticker or "the company")
+        return (
+            f"{company} ARPU trends reflect pricing strategy, subscriber mix shifts, "
+            "geographic expansion into lower-ARPU markets, and product tier evolution. "
+            "Growth in ad-supported tiers typically pressures ARPU while expanding TAM."
+        )
+
+    # Guidance/Outlook
+    if re.search(r'guidance|outlook|forecast|projected', q):
+        if yf_data and yf_data.get("revenue_ttm"):
+            rev = yf_data["revenue_ttm"]
+            qrev = rev / 4
+            company = yf_data.get("company_name", ticker)
+            return (
+                f"{company} quarterly revenue run rate: ~${qrev/1e9:.1f}B based on TTM revenue of ${rev/1e9:.1f}B. "
+                "Management guidance reflects macro conditions, pipeline visibility, and execution confidence."
+            )
+        return (
+            "Company guidance typically reflects management's view of macro conditions, "
+            "competitive dynamics, and pipeline visibility over the next 1-4 quarters."
+        )
+
+    # Beat/Miss questions
+    if re.search(r'beat|miss|exceeded|fell short|outperform|underperform', q):
+        return (
+            "To determine a beat or miss, compare actual reported results against "
+            "consensus analyst estimates or management guidance midpoint. "
+            "A beat occurs when actuals exceed estimates; a miss when they fall short."
+        )
+
+    # Trend analysis
+    if re.search(r'trend|changed|growth rate|decline|increase|year.over.year|yoy|quarter.over.quarter|qoq', q):
+        if yf_data:
+            parts = []
+            rg = yf_data.get("revenue_growth")
+            eg = yf_data.get("earnings_growth")
+            company = yf_data.get("company_name", ticker)
+            if rg:
+                parts.append(f"Revenue growth (YoY): {rg*100:.1f}%")
+            if eg:
+                parts.append(f"Earnings growth (YoY): {eg*100:.1f}%")
+            if parts:
+                return f"{company}: {' | '.join(parts)}"
+
+    # Risk factors
+    if re.search(r'risk factor|risk categor|1a|section 1', q):
+        return (
+            "SEC 10-K Section 1A risk factors typically span: Market/Competition risks, "
+            "Operational risks, Financial/Liquidity risks, Regulatory/Legal risks, "
+            "Cybersecurity risks, Supply Chain risks, Macroeconomic risks, "
+            "Technology/Innovation risks, Human Capital risks, and Environmental/ESG risks."
+        )
+
+    # M&A questions
+    if re.search(r'merger|acquisition|acquir|takeover|deal|transaction', q):
+        companies = [name for name in TICKER_MAP if name.lower() in q]
         if len(companies) >= 2:
             return (
-                f"Regarding the {companies[0]}/{companies[1]} transaction: "
-                "M&A transactions typically impact business operations through synergy realization, "
-                "regulatory scrutiny, employee retention, and strategic repositioning. "
-                "The acquirer typically pays a control premium (20-30% above market) "
-                "while facing integration risks and potential regulatory blocks."
+                f"The {companies[0]}/{companies[1]} transaction involves strategic rationale, "
+                "synergy realization, regulatory review, and integration execution. "
+                "Acquirers typically pay 20-30% control premium with integration costs "
+                "offsetting near-term synergies."
             )
 
-    if "arpu" in q_lower or "average revenue per" in q_lower:
-        # ARPU questions
-        ticker = extract_ticker(question)
-        company = ticker or "the company"
-        return (
-            f"{company}'s average revenue per user (ARPU) trends reflect "
-            "pricing strategy, subscriber mix, geographic expansion, and "
-            "product tier changes. Growth in ad-supported tiers typically "
-            "dilutes ARPU while expanding addressable market."
-        )
+    # Financial metrics from yfinance
+    if yf_data:
+        metrics = []
+        company = yf_data.get("company_name", ticker or "Company")
+        if yf_data.get("revenue_ttm"):
+            metrics.append(f"Revenue (TTM): ${yf_data['revenue_ttm']/1e9:.2f}B")
+        if yf_data.get("gross_margins"):
+            metrics.append(f"Gross margin: {yf_data['gross_margins']*100:.1f}%")
+        if yf_data.get("pe_ratio"):
+            metrics.append(f"P/E: {yf_data['pe_ratio']:.1f}x")
+        if yf_data.get("market_cap"):
+            metrics.append(f"Market cap: ${yf_data['market_cap']/1e9:.1f}B")
+        if metrics:
+            return f"{company} ({ticker}): {' | '.join(metrics)}."
 
-    if any(kw in q_lower for kw in ["guidance", "outlook", "forecast"]):
-        # Guidance questions
-        ticker = extract_ticker(question)
-        yf_data = fetch_yfinance_data(ticker) if ticker and HAS_YFINANCE else None
-        if yf_data:
-            rev = yf_data.get("revenue_ttm")
-            if rev:
-                estimate = rev / 4 * 1.05  # rough 5% growth estimate
-                return (
-                    f"Based on current financials, {yf_data.get('company_name', ticker)} "
-                    f"quarterly revenue run rate is approximately ${rev/4/1e9:.1f}B. "
-                    "Company guidance typically reflects macro conditions, "
-                    "competitive dynamics, and internal execution visibility."
-                )
-
-    if any(kw in q_lower for kw in ["beat", "miss", "exceeded", "fell short"]):
-        # Beat/Miss questions
-        ticker = extract_ticker(question)
-        import re
-        # Look for BPS difference
-        bps_match = re.search(r'(\d+)\s*bps?\s*(beat|miss)', q_lower)
-        if bps_match:
-            bps = int(bps_match.group(1))
-            direction = bps_match.group(2)
-            return f"The result was a {bps}bps {direction} versus guidance midpoint."
-
-    if any(kw in q_lower for kw in ["range", "guidance range"]):
-        ticker = extract_ticker(question)
-        return (
-            f"Quarterly guidance ranges reflect management's confidence interval "
-            "based on backlog visibility, macro conditions, and execution risk. "
-            "Narrower ranges indicate higher conviction; wider ranges suggest "
-            "more uncertainty in the business environment."
-        )
-
-    if any(kw in q_lower for kw in ["board", "director", "nominated", "appointed"]):
-        return (
-            "Board appointments are disclosed in company proxy statements (DEF 14A) "
-            "and 8-K filings. New directors typically bring relevant industry expertise "
-            "or shareholder perspectives to governance."
-        )
-
-    if any(kw in q_lower for kw in ["trend", "changed", "growth", "decline"]):
-        ticker = extract_ticker(question)
-        if ticker and HAS_YFINANCE:
-            yf_data = fetch_yfinance_data(ticker)
-            if yf_data:
-                rev_growth = yf_data.get("revenue_growth")
-                earn_growth = yf_data.get("earnings_growth")
-                parts = [f"{yf_data.get('company_name', ticker)} metrics:"]
-                if rev_growth:
-                    parts.append(f"Revenue growth (YoY): {rev_growth*100:.1f}%")
-                if earn_growth:
-                    parts.append(f"Earnings growth (YoY): {earn_growth*100:.1f}%")
-                if len(parts) > 1:
-                    return " | ".join(parts)
-
-    # Fallback: structured financial analysis
-    ticker = extract_ticker(question)
-    if ticker and HAS_YFINANCE:
-        yf_data = fetch_yfinance_data(ticker)
-        if yf_data:
-            fields = []
-            if yf_data.get("revenue_ttm"):
-                fields.append(f"Revenue: ${yf_data['revenue_ttm']/1e9:.2f}B")
-            if yf_data.get("pe_ratio"):
-                fields.append(f"P/E: {yf_data['pe_ratio']:.1f}x")
-            if yf_data.get("gross_margins"):
-                fields.append(f"Gross margin: {yf_data['gross_margins']*100:.1f}%")
-            if yf_data.get("market_cap"):
-                fields.append(f"Market cap: ${yf_data['market_cap']/1e9:.1f}B")
-            if fields:
-                company_name = yf_data.get("company_name", ticker)
-                return f"{company_name} ({ticker}): {'; '.join(fields)}."
-
-    # Generic answer with financial reasoning
+    # Generic financial analysis
     return (
-        "Based on standard financial analysis principles: "
-        "The requested metrics should be derived from the company's SEC filings "
-        "(10-K annual report or 10-Q quarterly report). "
-        "Key financial performance indicators include revenue growth, "
-        "margin trends, EPS trajectory, and cash flow generation. "
-        "For precise figures, refer to the company's latest earnings release "
-        "or investor relations materials."
+        "This financial question requires analysis of SEC filings and earnings reports. "
+        "Key financial metrics include revenue growth, margin trajectory, EPS trends, "
+        "free cash flow generation, and capital allocation strategy. "
+        "For precise figures, refer to the company's latest 10-K or earnings release."
     )
 
 
 # ============================================================
-# A2A GENERATE ENDPOINT HANDLER
+# MAIN ANSWER FUNCTION
 # ============================================================
 
-def handle_generate_request(
-    task_id: int,
-    question: str,
-    gold_answer: Optional[str] = None,
-    rubric: Optional[List[Dict]] = None,
-    difficulty_level: str = "Unknown",
-    question_type: str = "Unknown",
-    candidate_answer: Optional[str] = None,
-) -> str:
+def answer_finance_question(question: str, rubric: Optional[List] = None) -> str:
     """
-    Handle the /a2a/generate request from the green agent evaluator.
-    Returns a financial answer for the given question.
+    Main function to answer a finance question.
+    Strategy: Direct calc -> LLM with context -> Rule-based fallback
     """
-    log.info(f"Processing task {task_id}: type={question_type}, difficulty={difficulty_level}")
-    log.info(f"Question: {question[:100]}...")
+    log.info(f"Answering: {question[:120]}...")
 
-    # If candidate_answer provided (adversarial mode), use it
-    if candidate_answer:
-        return candidate_answer
+    # Step 1: Try direct calculation
+    calc_answer = try_direct_calculation(question)
+    if calc_answer:
+        log.info("Used direct calculation engine")
+        return calc_answer
 
-    # Build answer using available data
-    start_time = time.time()
-    answer = build_financial_answer(question, context_data={"rubric": rubric})
-    elapsed = time.time() - start_time
+    # Step 2: Fetch live market data if ticker found
+    ticker = extract_ticker(question)
+    yf_data = None
+    if ticker:
+        yf_data = fetch_yfinance_data(ticker)
+        if yf_data:
+            log.info(f"Fetched yfinance data for {ticker}: {yf_data.get('company_name', ticker)}")
 
-    log.info(f"Answer generated in {elapsed:.2f}s for task {task_id}")
-    return answer
+    # Step 3: Try LLM if available
+    if HAS_LITELLM and LLM_API_KEY:
+        # Build context from yfinance if available
+        context = ""
+        if yf_data:
+            fields = []
+            if yf_data.get("company_name"):
+                fields.append(f"Company: {yf_data['company_name']} ({ticker})")
+            if yf_data.get("sector"):
+                fields.append(f"Sector: {yf_data['sector']} / Industry: {yf_data.get('industry', 'N/A')}")
+            if yf_data.get("revenue_ttm"):
+                fields.append(f"Revenue (TTM): ${yf_data['revenue_ttm']/1e9:.2f}B")
+            if yf_data.get("gross_margins"):
+                fields.append(f"Gross Margin: {yf_data['gross_margins']*100:.1f}%")
+            if yf_data.get("pe_ratio"):
+                fields.append(f"P/E: {yf_data['pe_ratio']:.1f}x")
+            context = "\n".join(fields) if fields else ""
+
+        llm_answer = get_llm_answer(question, context, yf_data)
+        if llm_answer:
+            return llm_answer
+
+    # Step 4: Rule-based fallback
+    log.info("Using rule-based fallback")
+    return get_rule_based_answer(question, yf_data)
 
 
 # ============================================================
-# FASTAPI APP (PREFERRED)
+# A2A EXECUTOR (used by server.py)
 # ============================================================
+
+class FinanceExecutor(AgentExecutor):
+    """A2A AgentExecutor for the finance agent."""
+
+    async def execute(
+        self,
+        context: RequestContext,
+        event_queue: EventQueue,
+    ) -> None:
+        """Execute a finance analysis task."""
+        task = context.current_task
+        user_input = context.get_user_input()
+
+        # Extract question from A2A message
+        question = ""
+        if user_input:
+            if isinstance(user_input, str):
+                question = user_input
+            elif hasattr(user_input, 'parts'):
+                for part in user_input.parts:
+                    if hasattr(part, 'root') and hasattr(part.root, 'text'):
+                        question += part.root.text + " "
+                    elif hasattr(part, 'text'):
+                        question += part.text + " "
+            question = question.strip()
+
+        if not question:
+            question = "Provide a general financial market overview."
+
+        log.info(f"A2A execute: question length={len(question)}")
+
+        # Send working status
+        await event_queue.enqueue_event(
+            TaskStatusUpdateEvent(
+                task_id=task.id,
+                context_id=context.context_id,
+                status=TaskStatus(state=TaskState.working),
+                final=False,
+            )
+        )
+
+        # Generate answer
+        try:
+            answer = answer_finance_question(question)
+        except Exception as e:
+            log.error(f"Error generating answer: {e}")
+            answer = f"I encountered an error analyzing this financial question. Please try rephrasing."
+
+        # Send completed with artifact
+        await event_queue.enqueue_event(
+            TaskArtifactUpdateEvent(
+                task_id=task.id,
+                context_id=context.context_id,
+                artifact=Artifact(
+                    artifact_id=str(uuid.uuid4()),
+                    name="financial_analysis",
+                    parts=[Part(root=TextPart(text=answer))],
+                ),
+                append=False,
+                last_chunk=True,
+            )
+        )
+
+        await event_queue.enqueue_event(
+            TaskStatusUpdateEvent(
+                task_id=task.id,
+                context_id=context.context_id,
+                status=TaskStatus(state=TaskState.completed),
+                final=True,
+            )
+        )
+
+    async def cancel(
+        self, context: RequestContext, event_queue: EventQueue
+    ) -> None:
+        raise UnsupportedOperationError("cancel not supported")
+
+
+# ============================================================
+# STANDALONE FASTAPI APP (for direct testing / /a2a/generate endpoint)
+# ============================================================
+
+try:
+    from fastapi import FastAPI, Request
+    from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.responses import JSONResponse
+    import uvicorn
+    HAS_FASTAPI = True
+except ImportError:
+    HAS_FASTAPI = False
 
 if HAS_FASTAPI:
     app = FastAPI(
         title="AutoPilotAI Finance Agent",
-        description="A2A compliant finance agent for FinanceBench evaluation",
+        description="A2A finance agent for FinanceBench/AgentBeats evaluation",
         version=AGENT_VERSION
     )
 
@@ -523,15 +608,15 @@ if HAS_FASTAPI:
         allow_headers=["*"],
     )
 
-    AGENT_CARD = {
+    AGENT_CARD_JSON = {
         "name": "AutoPilotAI Finance Agent",
         "description": (
-            "Autonomous finance agent specializing in financial analysis, "
-            "FinanceBench Q&A, SEC filing analysis, market metrics, "
-            "portfolio optimization, and agent economy analytics."
+            "Autonomous finance agent for FinanceBench evaluation. "
+            "Handles quantitative retrieval, GAAP adjustments, beat-or-miss analysis, "
+            "trend analysis, financial modeling, and market analysis from SEC filings."
         ),
         "version": AGENT_VERSION,
-        "url": f"https://agentbeats-finance.chitacloud.dev",
+        "url": "https://agentbeats-finance.chitacloud.dev",
         "capabilities": {
             "streaming": False,
             "pushNotifications": False,
@@ -543,32 +628,12 @@ if HAS_FASTAPI:
             {
                 "id": "financebench-qa",
                 "name": "FinanceBench Q&A",
-                "description": "Answer financial questions from SEC filings and earnings reports",
-                "tags": ["finance", "sec", "earnings", "analysis"],
+                "description": "537-question FinanceBench benchmark: quantitative retrieval, GAAP analysis, beat/miss, trends, financial modeling",
+                "tags": ["finance", "sec", "earnings", "benchmark", "10-k"],
                 "examples": [
                     "How has Netflix ARPU changed from 2019 to 2024?",
-                    "What is AMD's revenue guidance range for Q2 2024?",
-                    "Did TJX beat its Q4 FY2025 pre-tax margin guidance?"
-                ]
-            },
-            {
-                "id": "financial-calculations",
-                "name": "Financial Calculations",
-                "description": "Calculate P/E ratios, CAGR, margins, and other financial metrics",
-                "tags": ["calculations", "metrics", "ratios"],
-                "examples": [
-                    "Calculate CAGR from $10,000 to $15,000 over 3 years",
-                    "What is the P/E ratio if price is $150 and EPS is $5?"
-                ]
-            },
-            {
-                "id": "market-data",
-                "name": "Live Market Data",
-                "description": "Real-time stock prices, crypto prices, and financial metrics",
-                "tags": ["market", "realtime", "stocks", "crypto"],
-                "examples": [
-                    "What is the current price of NVDA?",
-                    "What is Bitcoin's price in USD?"
+                    "Did TJX beat its Q4 FY2025 pre-tax margin guidance?",
+                    "What is AMD's revenue CAGR from 2020 to 2023?"
                 ]
             }
         ]
@@ -576,56 +641,42 @@ if HAS_FASTAPI:
 
     @app.get("/.well-known/agent.json")
     async def agent_card():
-        return AGENT_CARD
+        return AGENT_CARD_JSON
 
     @app.get("/health")
     async def health():
         return {
             "status": "healthy",
-            "agent": AGENT_ID,
             "version": AGENT_VERSION,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "llm_enabled": HAS_LITELLM and bool(LLM_API_KEY),
+            "llm_model": LLM_MODEL if (HAS_LITELLM and LLM_API_KEY) else None,
             "yfinance": HAS_YFINANCE,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
     @app.post("/a2a/generate")
     async def generate(request: Request):
-        """Main endpoint called by green agent evaluators."""
+        """Main evaluation endpoint for FinanceBench/AgentBeats."""
         body = await request.json()
-        answer = handle_generate_request(
-            task_id=body.get("task_id", 0),
-            question=body.get("question", ""),
-            gold_answer=body.get("gold_answer"),
-            rubric=body.get("rubric"),
-            difficulty_level=body.get("difficulty_level", "Unknown"),
-            question_type=body.get("question_type", "Unknown"),
-            candidate_answer=body.get("candidate_answer"),
-        )
+        question = body.get("question", "")
+        rubric = body.get("rubric")
+        answer = answer_finance_question(question, rubric)
         return {
             "task_id": body.get("task_id", 0),
             "answer": answer,
-            "mode": "llm",
+            "mode": "llm" if (HAS_LITELLM and LLM_API_KEY) else "rule_based",
             "generated_at": datetime.now(timezone.utc).isoformat(),
-        }
-
-    @app.get("/a2a/status")
-    async def a2a_status():
-        return {
-            "status": "ready",
-            "agent_id": AGENT_ID,
-            "version": AGENT_VERSION,
-            "capabilities": ["financebench-qa", "financial-calculations", "market-data"],
         }
 
     @app.post("/")
     async def a2a_jsonrpc(request: Request):
-        """A2A JSON-RPC endpoint (fallback)."""
+        """A2A JSON-RPC endpoint."""
         body = await request.json()
         method = body.get("method", "")
         params = body.get("params", {})
         rpc_id = body.get("id")
 
-        if method == "tasks/send":
+        if method in ("tasks/send", "tasks/sendSubscribe"):
             message = params.get("message", {})
             parts = message.get("parts", [])
             question = ""
@@ -635,178 +686,32 @@ if HAS_FASTAPI:
                     break
             if not question:
                 question = params.get("text", params.get("query", ""))
-
-            answer = build_financial_answer(question)
-            task_id = str(uuid.uuid4())
-            return {
-                "jsonrpc": "2.0",
-                "id": rpc_id,
-                "result": {
-                    "id": task_id,
-                    "status": "completed",
-                    "result": {
-                        "parts": [{"type": "text", "text": answer}]
-                    }
-                }
-            }
-
-        elif method == "tasks/sendSubscribe":
-            message = params.get("message", {})
-            parts = message.get("parts", [])
-            question = ""
-            for p in parts:
-                if p.get("type") == "text":
-                    question = p.get("text", "")
-                    break
-            answer = build_financial_answer(question)
+            answer = answer_finance_question(question)
             return {
                 "jsonrpc": "2.0",
                 "id": rpc_id,
                 "result": {
                     "id": str(uuid.uuid4()),
                     "status": "completed",
-                    "result": {
-                        "parts": [{"type": "text", "text": answer}]
-                    }
+                    "result": {"parts": [{"type": "text", "text": answer}]}
                 }
             }
-
         return JSONResponse(
             status_code=400,
-            content={"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32601, "message": f"Method not found: {method}"}}
+            content={"jsonrpc": "2.0", "id": rpc_id,
+                     "error": {"code": -32601, "message": f"Method not found: {method}"}}
         )
-
-    @app.post("/analyze")
-    async def analyze(request: Request):
-        """Simple REST analysis endpoint."""
-        body = await request.json()
-        question = body.get("query", body.get("message", body.get("question", "")))
-        answer = build_financial_answer(question)
-        return {"answer": answer, "agent": AGENT_ID}
-
-    @app.get("/capabilities")
-    async def capabilities():
-        return {
-            "supported_tasks": ["financebench-qa", "financial-calculations", "market-data", "portfolio-analysis"],
-            "a2a_version": "0.2.6",
-            "agent_id": AGENT_ID,
-            "yfinance_enabled": HAS_YFINANCE,
-        }
-
-
-# ============================================================
-# FALLBACK HTTP SERVER (if no FastAPI)
-# ============================================================
-
-else:
-    from http.server import HTTPServer, BaseHTTPRequestHandler
-
-    AGENT_CARD_FALLBACK = {
-        "name": "AutoPilotAI Finance Agent",
-        "description": "A2A finance agent for FinanceBench evaluation",
-        "version": AGENT_VERSION,
-        "url": "https://agentbeats-finance.chitacloud.dev",
-        "capabilities": {"streaming": False, "pushNotifications": False, "stateTransitionHistory": False},
-        "defaultInputModes": ["text"],
-        "defaultOutputModes": ["text"],
-    }
-
-    class A2AHandler(BaseHTTPRequestHandler):
-        def log_message(self, fmt, *args):
-            log.info(f"HTTP {self.address_string()} - {fmt % args}")
-
-        def send_json(self, code: int, data: Dict):
-            body = json.dumps(data, indent=2).encode()
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(body)
-
-        def do_GET(self):
-            path = self.path.split("?")[0]
-            if path == "/.well-known/agent.json":
-                self.send_json(200, AGENT_CARD_FALLBACK)
-            elif path == "/health":
-                self.send_json(200, {"status": "healthy", "agent": AGENT_ID, "version": AGENT_VERSION})
-            elif path in ["/a2a/status", "/capabilities"]:
-                self.send_json(200, {"status": "ready", "agent_id": AGENT_ID})
-            else:
-                self.send_json(404, {"error": "Not found"})
-
-        def do_POST(self):
-            path = self.path.split("?")[0]
-            content_length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(content_length) if content_length > 0 else b"{}"
-            try:
-                payload = json.loads(body)
-            except Exception:
-                self.send_json(400, {"error": "Invalid JSON"})
-                return
-
-            if path == "/a2a/generate":
-                answer = handle_generate_request(
-                    task_id=payload.get("task_id", 0),
-                    question=payload.get("question", ""),
-                    gold_answer=payload.get("gold_answer"),
-                    rubric=payload.get("rubric"),
-                    difficulty_level=payload.get("difficulty_level", "Unknown"),
-                    question_type=payload.get("question_type", "Unknown"),
-                )
-                self.send_json(200, {
-                    "task_id": payload.get("task_id", 0),
-                    "answer": answer,
-                    "mode": "llm",
-                    "generated_at": datetime.now(timezone.utc).isoformat(),
-                })
-
-            elif path == "/":
-                method = payload.get("method", "")
-                params = payload.get("params", {})
-                rpc_id = payload.get("id")
-                message = params.get("message", {})
-                parts = message.get("parts", [])
-                question = ""
-                for p in parts:
-                    if p.get("type") == "text":
-                        question = p.get("text", "")
-                        break
-                if not question:
-                    question = params.get("text", params.get("query", ""))
-                answer = build_financial_answer(question)
-                self.send_json(200, {
-                    "jsonrpc": "2.0",
-                    "id": rpc_id,
-                    "result": {
-                        "id": str(uuid.uuid4()),
-                        "status": "completed",
-                        "result": {"parts": [{"type": "text", "text": answer}]}
-                    }
-                })
-            else:
-                self.send_json(404, {"error": "Not found"})
-
-        def do_OPTIONS(self):
-            self.send_response(200)
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
-            self.end_headers()
-
-
-def main():
-    log.info(f"Starting AutoPilotAI Finance Agent v{AGENT_VERSION} on port {PORT}")
-    log.info(f"FastAPI available: {HAS_FASTAPI}, yfinance: {HAS_YFINANCE}")
-
-    if HAS_FASTAPI:
-        log.info(f"Starting FastAPI server on 0.0.0.0:{PORT}")
-        uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
-    else:
-        log.info(f"Starting fallback HTTP server on 0.0.0.0:{PORT}")
-        server = HTTPServer(("0.0.0.0", PORT), A2AHandler)
-        server.serve_forever()
 
 
 if __name__ == "__main__":
-    main()
+    # Standalone mode for testing
+    import sys
+    if len(sys.argv) > 1:
+        q = " ".join(sys.argv[1:])
+        print(f"Q: {q}")
+        print(f"A: {answer_finance_question(q)}")
+    else:
+        if HAS_FASTAPI:
+            uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+        else:
+            print("FastAPI not available")
