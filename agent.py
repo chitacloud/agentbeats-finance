@@ -305,8 +305,10 @@ class FinanceAgent:
         """Process a natural language or JSON finance query."""
         content = message_content.lower()
 
-        # Route to appropriate capability
-        if any(w in content for w in ["price", "btc", "eth", "near", "crypto", "token"]):
+        # Route to appropriate capability - check more specific routes first
+        if any(w in content for w in ["near market", "agent economy", "market.near.ai", "agent market"]):
+            return self._handle_near_market_query()
+        elif any(w in content for w in ["price", "btc", "eth", "near price", "crypto", "token"]):
             return self._handle_price_query(message_content)
         elif any(w in content for w in ["portfolio", "holdings", "allocation", "diversif"]):
             return self._handle_portfolio_query(message_content)

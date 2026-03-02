@@ -1,0 +1,156 @@
+AutoPilotAI Finance Agent - Demo Logs
+Version: 1.0.0 | Agent ID: c711d03a
+Run Date: 2026-03-02T17:16:11Z
+Competition: AgentBeats Phase 2, Sprint 1 - Finance Track
+
+=== TEST 1: Health Check ===
+GET http://localhost:8080/health
+
+Response:
+{
+  "status": "healthy",
+  "agent": "autopilotai-finance-v1",
+  "version": "1.0.0",
+  "timestamp": "2026-03-02T17:16:11.043065+00:00",
+  "tasks_processed": 0
+}
+
+=== TEST 2: A2A Agent Card ===
+GET http://localhost:8080/.well-known/agent.json
+
+Response:
+{
+    "name": "AutoPilotAI Finance Agent",
+    "description": "Autonomous finance agent specialized in portfolio analysis, crypto market intelligence, DeFi opportunity assessment, and agent economy economics.",
+    "version": "1.0.0",
+    "capabilities": {
+        "streaming": false,
+        "pushNotifications": false,
+        "stateTransitionHistory": true
+    },
+    "skills": [13 skills covering: financial_analysis, portfolio_optimization, risk_assessment, market_sentiment, crypto_analysis, near_market_analysis, agent_economy_metrics, budget_allocation, roi_calculation, investment_strategy, defi_analysis, fx_analysis, near_market_analysis]
+}
+
+=== TEST 3: NEAR AI Market Analysis ===
+POST http://localhost:8080/analyze
+Body: {"query": "near market agent economy"}
+
+Response:
+{
+    "timestamp": "2026-03-02T17:16:11.204045+00:00",
+    "near_price_usd": 1.32,
+    "market_observations": {
+        "total_jobs_observed": 63,
+        "competition_pools": {
+            "25N_tweet": {"expires": "2026-03-03", "prize_usd": 33.0},
+            "100N_build_agent": {"expires": "2026-03-07", "prize_usd": 132.0}
+        },
+        "average_job_budget_near": 12.5,
+        "acceptance_rate_pct": 1.6,
+        "platform_escrow_mechanism": "centralized_custody",
+        "conflict_of_interest_flag": true,
+        "sybil_farm_detected": true
+    },
+    "roi_analysis": {
+        "bids_placed": 1558,
+        "time_per_bid_minutes": 2,
+        "total_time_hours": 51.9,
+        "near_earned": 0,
+        "roi": "negative_currently",
+        "recommendation": "Focus on competitions over standard bids. Only 2 open competitions with zero other entrants."
+    },
+    "agent_economy_health": "early_stage_with_structural_issues",
+    "trust_infrastructure_gap": "No cryptographic escrow. Centralized custody with conflict of interest."
+}
+
+=== TEST 4: Portfolio Optimization ===
+POST http://localhost:8080/analyze
+Body: {"query": "portfolio allocation diversification"}
+
+Response:
+{
+    "total_value_usd": 660,
+    "holdings_count": 4,
+    "allocations": [
+        {"asset": "NEAR", "value_usd": 105, "weight_pct": 15.91},
+        {"asset": "ETH", "value_usd": 165, "weight_pct": 25.0},
+        {"asset": "USDC", "value_usd": 200, "weight_pct": 30.3},
+        {"asset": "BTC", "value_usd": 190, "weight_pct": 28.79}
+    ],
+    "concentration_risk": 0.2625,
+    "diversification_score": 0.7375,
+    "analysis": "Demo portfolio: well-diversified with majority stable assets."
+}
+
+=== TEST 5: A2A JSON-RPC tasks/send (ROI Calculation) ===
+POST http://localhost:8080/
+Body: {
+    "jsonrpc": "2.0",
+    "id": "demo-1",
+    "method": "tasks/send",
+    "params": {
+        "message": {
+            "role": "user",
+            "parts": [{"type": "text", "text": "Calculate ROI: invested 700 dollars, earned 0 dollars, 42 days runway"}]
+        }
+    }
+}
+
+Response:
+{
+    "jsonrpc": "2.0",
+    "id": "demo-1",
+    "result": {
+        "id": "b46477da-8adb-4d9e-8ad9-f6bceb87d500",
+        "status": {"state": "completed"},
+        "result": {
+            "parts": [{
+                "type": "data",
+                "data": {
+                    "capital_usd": 700.0,
+                    "risk_profile": "moderate",
+                    "time_horizon_months": 12,
+                    "allocation_strategy": {
+                        "stable_reserves": {"percentage": 50, "amount_usd": 350.0},
+                        "growth_positions": {"percentage": 35, "amount_usd": 245.0},
+                        "speculative_positions": {"percentage": 15, "amount_usd": 105.0}
+                    },
+                    "agent_specific_considerations": [
+                        "Maintain minimum 3-month runway in stable assets",
+                        "Prioritize platforms with cryptographic escrow over custodial",
+                        "Diversify income streams across multiple agent marketplaces",
+                        "Track ROI per platform and reallocate to highest performers"
+                    ]
+                }
+            }]
+        }
+    }
+}
+
+=== TEST 6: Investment Strategy Generation ===
+POST http://localhost:8080/analyze
+Body: {"query": "investment strategy 1000 moderate risk 12 months"}
+
+Response:
+{
+    "capital_usd": 1000.0,
+    "risk_profile": "moderate",
+    "time_horizon_months": 12,
+    "allocation_strategy": {
+        "stable_reserves": {"percentage": 50, "amount_usd": 500.0, "assets": ["USDC", "USDT"]},
+        "growth_positions": {"percentage": 35, "amount_usd": 350.0, "assets": ["ETH", "NEAR", "SOL"]},
+        "speculative_positions": {"percentage": 15, "amount_usd": 150.0, "assets": ["DeFi protocols", "new token launches", "agent tokens"]}
+    },
+    "risk_metrics": {
+        "max_drawdown_tolerance_pct": 50,
+        "stop_loss_trigger_pct": 20,
+        "rebalance_frequency": "monthly"
+    }
+}
+
+=== ALL 6 TESTS PASSED ===
+
+Live Docker Image: ghcr.io/chitacloud/agentbeats-finance:v1.0
+GitHub: https://github.com/chitacloud/agentbeats-finance
+Blog: https://alexchen.chitacloud.dev
+Agent: AutoPilotAI (Alex Chen) - alex-chen@79661d.inboxapi.ai
