@@ -1,117 +1,87 @@
-AutoPilotAI Finance Agent - AgentBeats Sprint 1
+AutoPilotAI Finance Agent v3.0
+AgentBeats Phase 2, Sprint 1 - Finance Track
 
-A2A Protocol compliant autonomous finance agent for portfolio analysis,
-crypto market intelligence, DeFi assessment, and agent economy economics.
+OfficeQA-compatible A2A agent for US Treasury Bulletin analysis.
 
-Author: Alex Chen (alexchenai)
-Email: alex-chen@79661d.inboxapi.ai
+BENCHMARK: OfficeQA
+
+The OfficeQA benchmark evaluates end-to-end grounded reasoning over US Treasury
+Bulletins spanning January 1939 through September 2025.
+
+- 697 PDFs from the FRASER archive (Federal Reserve Bank of St. Louis)
+- ~89,000 pages of scanned government documents
+- 246 questions split 46% easy / 54% hard
+- Scoring: exact match with fuzzy match for formatting (0.0% tolerance)
+
+Top baseline scores:
+- GPT-5.1 Agent: 43.1% overall, 24.8% on hard subset
+- Claude Opus 4.5 Agent: 37.4% overall, 21.1% on hard subset
+
+AGENT APPROACH
+
+1. Document Retrieval: Fetch Treasury Bulletins from FRASER archive on demand
+2. LLM Extraction: Use LLM to extract specific values from document text
+3. Multi-step Computation: Handle arithmetic/statistical questions
+4. Fallback: LLM knowledge for questions without accessible source docs
+
+ENDPOINTS
+
+POST /a2a/generate     - Main evaluation endpoint (A2A tasks/send)
+GET  /.well-known/agent.json - A2A agent card
+GET  /health           - Health check
+POST /                 - JSON-RPC fallback
+
+REQUEST FORMAT
+
+{
+  "id": "task-uuid",
+  "message": {
+    "parts": [
+      {
+        "type": "text",
+        "text": "What was the total public debt outstanding in January 1985?"
+      },
+      {
+        "type": "data",
+        "data": {
+          "source_docs": [
+            "https://fraser.stlouisfed.org/title/treasury-bulletin-407/january-1985-XXXXX"
+          ]
+        }
+      }
+    ]
+  }
+}
+
+RESPONSE FORMAT
+
+{
+  "id": "task-uuid",
+  "status": {"state": "completed"},
+  "artifacts": [{"parts": [{"type": "text", "text": "$1,499,860 million"}]}],
+  "answer": "$1,499,860 million"
+}
+
+DEPLOYMENT
+
+Docker:
+  docker build -t agentbeats-finance .
+  docker run -p 8080:8080 -e LLM_API_KEY=your-key agentbeats-finance
+
+Environment variables:
+  LLM_API_KEY    - API key for LLM (required for best performance)
+  LLM_MODEL      - Model to use (default: gpt-4o)
+  PORT           - Port to listen on (default: 8080)
+
+DOCKER IMAGE
+
+ghcr.io/chitacloud/agentbeats-finance:latest
+
+GitHub Actions CI builds and pushes on every push to main.
+
+AUTHOR
+
+Alex Chen (AutoPilotAI)
 Blog: alexchen.chitacloud.dev
-Competition: AgentBeats Phase 2, Sprint 1 - Finance Track
-GitHub: https://github.com/chitacloud/agentbeats-finance
-
-
-WHAT THIS AGENT DOES
-
-This agent provides financial analysis and decision support for autonomous AI agents.
-It is specifically designed for the emerging agent economy where AIs need to:
-- Manage crypto wallets and portfolio allocation
-- Assess risk across different agent marketplaces
-- Calculate ROI for agent operations
-- Identify DeFi yield opportunities
-- Analyze agent economy market dynamics
-
-
-SUPPORTED CAPABILITIES
-
-- financial_analysis: Comprehensive financial analysis
-- portfolio_optimization: Portfolio allocation and diversification scoring
-- risk_assessment: Platform risk, income risk, market risk analysis
-- market_sentiment: Crypto market sentiment analysis
-- crypto_analysis: Real-time cryptocurrency price data (CoinGecko)
-- near_market_analysis: NEAR AI Market agent economy metrics
-- agent_economy_metrics: Autonomous agent economic health indicators
-- budget_allocation: Budget planning for agent operations
-- roi_calculation: ROI calculation with annualized returns
-- investment_strategy: Risk-profiled investment strategies
-- defi_analysis: DeFi protocol opportunity assessment
-- fx_analysis: Foreign exchange analysis
-
-
-A2A PROTOCOL COMPLIANCE
-
-This agent implements the Agent-to-Agent (A2A) protocol:
-- Agent card: GET /.well-known/agent.json
-- Task submission: POST / (JSON-RPC 2.0)
-  - Method: tasks/send
-  - Method: tasks/get
-  - Method: tasks/cancel
-- Simple REST: POST /analyze {"query": "your question"}
-- Health check: GET /health
-
-
-QUICK START
-
-Using Docker:
-
-  docker pull ghcr.io/chitacloud/agentbeats-finance:v1.0
-  docker run -p 8080:8080 ghcr.io/chitacloud/agentbeats-finance:v1.0
-
-Test the agent:
-
-  curl http://localhost:8080/.well-known/agent.json
-
-  curl -X POST http://localhost:8080/ \
-    -H "Content-Type: application/json" \
-    -d '{"jsonrpc":"2.0","id":"1","method":"tasks/send","params":{"message":{"role":"user","parts":[{"type":"text","text":"What is the current NEAR price?"}]}}}'
-
-  curl -X POST http://localhost:8080/analyze \
-    -H "Content-Type: application/json" \
-    -d '{"query": "Generate an investment strategy for $1000 with moderate risk"}'
-
-
-BUILDING LOCALLY
-
-  docker build --platform linux/amd64 -t agentbeats-finance:v1.0 .
-  docker run -p 8080:8080 agentbeats-finance:v1.0
-
-
-DEMO CAPABILITIES
-
-1. NEAR AI Market Analysis
-   Analyzes the structural economics of the NEAR AI Market, including sybil farm
-   detection, conflict of interest in escrow, and competition ROI.
-
-2. Portfolio Optimization
-   Calculates portfolio metrics including Herfindahl-Hirschman Index for
-   concentration risk and diversification scoring.
-
-3. Investment Strategy Generation
-   Generates risk-profiled strategies (conservative/moderate/aggressive) with
-   specific allocation percentages and agent-specific considerations.
-
-4. DeFi Opportunity Assessment
-   Analyzes DeFi protocols including Uniswap, Aave, Compound, and NEAR Ref Finance.
-
-5. Real-Time Crypto Prices
-   Fetches live prices for BTC, ETH, NEAR, SOL, BNB, TON, LINK via CoinGecko.
-
-
-ARCHITECTURE
-
-Single-file Python service with zero external dependencies beyond requests.
-Uses Python's built-in HTTP server for maximum portability.
-All financial computations are deterministic and auditable.
-No private keys or wallets embedded - analysis only.
-
-
-AGENT IDENTITY
-
-This agent was built by AutoPilotAI (Alex Chen), an autonomous AI agent
-that builds trust infrastructure for the agent economy.
-
-Live services:
-- alexchen.chitacloud.dev (blog + deliverables)
-- trust-token.chitacloud.dev (reputation protocol)
-- agentmarket.chitacloud.dev (agent marketplace)
-- skillscan.chitacloud.dev (MCP security scanner)
-- agent-commerce-os.chitacloud.dev (x402 payment layer)
+Email: alex-chen@79661d.inboxapi.ai
+Competition: AgentBeats Phase 2, Sprint 1 (March 2-22, 2026)

@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """
-AutoPilotAI Finance Agent v2.1 - AgentBeats Sprint 1 Entry
-FinanceBench-compatible A2A compliant autonomous finance agent with SEC EDGAR integration.
+AutoPilotAI Finance Agent v3.0 - AgentBeats Sprint 1 Entry
+OfficeQA-compatible A2A compliant finance agent for US Treasury Bulletin analysis.
 
-Supports:
-- /a2a/generate (green agent evaluation endpoint)
-- /.well-known/agent.json (A2A agent card)
-- /health (health check)
-- / (A2A JSON-RPC fallback)
+The OfficeQA benchmark evaluates end-to-end grounded reasoning over US Treasury Bulletins
+spanning 1939-2025. 697 scanned PDFs, ~89,000 pages. Each question requires:
+1. Locating source material in Treasury Bulletins (FRASER archive)
+2. Extracting values from tables/figures through document parsing
+3. Executing multi-step computations
+
+Supports A2A protocol endpoints:
+- POST /a2a/generate (task execution - main eval endpoint)
+- GET /.well-known/agent.json (A2A agent card)
+- GET /health (health check)
+- POST / (A2A JSON-RPC fallback)
 
 Author: Alex Chen (AutoPilotAI) - alexchen.chitacloud.dev
 Competition: AgentBeats Phase 2, Sprint 1 - Finance Track
@@ -26,7 +32,6 @@ import urllib.request
 import urllib.parse
 import urllib.error
 
-# Try FastAPI for the proper A2A server
 try:
     from fastapi import FastAPI, Request
     from fastapi.middleware.cors import CORSMiddleware
@@ -36,12 +41,11 @@ try:
 except ImportError:
     HAS_FASTAPI = False
 
-# Try yfinance for financial data
 try:
-    import yfinance as yf
-    HAS_YFINANCE = True
+    import litellm
+    HAS_LITELLM = True
 except ImportError:
-    HAS_YFINANCE = False
+    HAS_LITELLM = False
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,1531 +53,647 @@ logging.basicConfig(
 )
 log = logging.getLogger("finance_agent")
 
-AGENT_ID = "autopilotai-finance-v2"
-AGENT_VERSION = "2.1.0"
+AGENT_ID = "autopilotai-finance-v3"
+AGENT_VERSION = "3.0.0"
 PORT = int(os.environ.get("PORT", 8080))
-EDGAR_USER_AGENT = "AutoPilotAI alex-chen@79661d.inboxapi.ai"
+LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o")
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 
-# Cache for EDGAR data (avoid repeated API calls)
-_edgar_cache: Dict[str, Any] = {}
-_cik_cache: Dict[str, str] = {}
-_company_tickers: Dict[str, Dict] = {}
-
+# FRASER base URL for Treasury Bulletins
+FRASER_BASE = "https://fraser.stlouisfed.org"
+FRASER_TITLE_ID = 407  # Treasury Bulletin series ID
 
 # ============================================================
-# FINANCIAL FORMULAS
+# DOCUMENT FETCHING FROM FRASER ARCHIVE
 # ============================================================
 
-def safe_div(a, b, default=None):
+_doc_cache: Dict[str, str] = {}
+
+def fetch_fraser_document(url: str) -> Optional[str]:
+    """
+    Fetch a Treasury Bulletin document from the FRASER archive.
+    Returns the text content of the document.
+    """
+    if url in _doc_cache:
+        return _doc_cache[url]
+
     try:
-        if b == 0:
-            return default
-        return a / b
-    except Exception:
-        return default
+        log.info(f"Fetching FRASER document: {url}")
+        headers = {
+            "User-Agent": "AutoPilotAI/3.0 (alex-chen@79661d.inboxapi.ai; AgentBeats Finance Agent)"
+        }
 
+        # Try to get the page content first (HTML with document links)
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            content = resp.read().decode("utf-8", errors="ignore")
 
-FINANCIAL_FORMULAS = {
-    "pe_ratio": lambda price, eps: round(safe_div(price, eps, 0), 2),
-    "cagr": lambda start, end, years: round(((end / start) ** (1 / years) - 1) * 100, 2) if start and end and years else None,
-    "gross_margin": lambda revenue, cogs: round((revenue - cogs) / revenue * 100, 2) if revenue else None,
-    "operating_margin": lambda op_income, revenue: round(op_income / revenue * 100, 2) if revenue else None,
-    "net_margin": lambda net_income, revenue: round(net_income / revenue * 100, 2) if revenue else None,
-    "current_ratio": lambda ca, cl: round(safe_div(ca, cl, 0), 2),
-    "quick_ratio": lambda ca, inv, cl: round(safe_div(ca - inv, cl, 0), 2),
-    "debt_to_equity": lambda debt, equity: round(safe_div(debt, equity, 0), 2),
-    "asset_turnover": lambda revenue, assets: round(safe_div(revenue, assets, 0), 2),
-    "fixed_asset_turnover": lambda revenue, ppe: round(safe_div(revenue, ppe, 0), 2),
-    "return_on_assets": lambda net_income, assets: round(safe_div(net_income, assets, 0) * 100, 2),
-    "return_on_equity": lambda net_income, equity: round(safe_div(net_income, equity, 0) * 100, 2),
-    "inventory_turnover": lambda cogs, inventory: round(safe_div(cogs, inventory, 0), 2),
-    "dpo": lambda ap, cogs: round(safe_div(ap * 365, cogs, 0), 2),
-    "dso": lambda ar, revenue: round(safe_div(ar * 365, revenue, 0), 2),
-    "capex_pct_revenue": lambda capex, revenue: round(safe_div(capex, revenue, 0) * 100, 2),
-    "fcf": lambda cfo, capex: cfo - capex,
-    "fcf_margin": lambda fcf, revenue: round(safe_div(fcf, revenue, 0) * 100, 2),
-    "ebitda": lambda ebit, da: ebit + da,
-    "interest_coverage": lambda ebit, interest: round(safe_div(ebit, interest, 0), 2),
-}
+        # Extract PDF link from the page
+        pdf_url = extract_pdf_url(content, url)
+        if pdf_url:
+            text = fetch_pdf_text(pdf_url)
+            if text:
+                _doc_cache[url] = text
+                return text
 
+        # If no PDF, try to extract text from HTML directly
+        text = extract_text_from_html(content)
+        if text:
+            _doc_cache[url] = text
+            return text
 
-# ============================================================
-# EDGAR CIK LOOKUP
-# ============================================================
-
-def load_company_tickers():
-    """Load company tickers from SEC EDGAR."""
-    global _company_tickers
-    if _company_tickers:
-        return _company_tickers
-    try:
-        req = urllib.request.Request(
-            "https://www.sec.gov/files/company_tickers.json",
-            headers={"User-Agent": EDGAR_USER_AGENT}
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read())
-            _company_tickers = {
-                v["title"].upper(): str(v["cik_str"]).zfill(10)
-                for v in data.values()
-            }
-            # Also add ticker -> CIK
-            for v in data.values():
-                ticker = v.get("ticker", "").upper()
-                if ticker:
-                    _company_tickers[ticker] = str(v["cik_str"]).zfill(10)
-            log.info(f"Loaded {len(_company_tickers)} company tickers from EDGAR")
     except Exception as e:
-        log.warning(f"Failed to load company tickers: {e}")
-    return _company_tickers
-
-
-# Hard-coded CIK map for FinanceBench companies
-COMPANY_CIK_MAP = {
-    "3M": "0000066740",
-    "MMM": "0000066740",
-    "ACTIVISION": "0000718877",
-    "ACTIVISION BLIZZARD": "0000718877",
-    "ATVI": "0000718877",
-    "ADOBE": "0000796343",
-    "ADBE": "0000796343",
-    "AES": "0000874761",
-    "AES CORPORATION": "0000874761",
-    "AMAZON": "0001018724",
-    "AMZN": "0001018724",
-    "APPLE": "0000320193",
-    "AAPL": "0000320193",
-    "MICROSOFT": "0000789019",
-    "MSFT": "0000789019",
-    "GOOGLE": "0001652044",
-    "ALPHABET": "0001652044",
-    "GOOGL": "0001652044",
-    "TESLA": "0001318605",
-    "TSLA": "0001318605",
-    "META": "0001326801",
-    "FACEBOOK": "0001326801",
-    "NVIDIA": "0001045810",
-    "NVDA": "0001045810",
-    "AMD": "0000002488",
-    "NETFLIX": "0001065280",
-    "NFLX": "0001065280",
-    "JPM": "0000019617",
-    "JPMORGAN": "0000019617",
-    "WALMART": "0000104169",
-    "WMT": "0000104169",
-    "US STEEL": "0001163302",
-    "UNITED STATES STEEL": "0001163302",
-    "X": "0001163302",
-    "TJX": "0000109198",
-    "TJX COMPANIES": "0000109198",
-    "BBSI": "0000914156",
-    "BARRETT BUSINESS SERVICES": "0000914156",
-    "PFIZER": "0000078003",
-    "PFE": "0000078003",
-    "JOHNSON & JOHNSON": "0000200406",
-    "JNJ": "0000200406",
-    "EXXON": "0000034088",
-    "XOM": "0000034088",
-    "CHEVRON": "0000093410",
-    "CVX": "0000093410",
-    "BERKSHIRE HATHAWAY": "0001067983",
-    "BRK-B": "0001067983",
-    "DISNEY": "0001001039",
-    "DIS": "0001001039",
-    "AT&T": "0000732717",
-    "T": "0000732717",
-    "VERIZON": "0000732712",
-    "VZ": "0000732712",
-    "PAYPAL": "0001633917",
-    "PYPL": "0001633917",
-    "VISA": "0001403161",
-    "V": "0001403161",
-    "MASTERCARD": "0001141391",
-    "MA": "0001141391",
-    "PALO ALTO": "0001327567",
-    "PANW": "0001327567",
-    "CROWDSTRIKE": "0001517396",
-    "CRWD": "0001517396",
-    "PALANTIR": "0001321655",
-    "PLTR": "0001321655",
-    "SNOWFLAKE": "0001640147",
-    "SNOW": "0001640147",
-    # FinanceBench commonly tested companies
-    "INTEL": "0000050863",
-    "INTC": "0000050863",
-    "IBM": "0000051143",
-    "ORACLE": "0001341439",
-    "ORCL": "0001341439",
-    "SALESFORCE": "0001108524",
-    "CRM": "0001108524",
-    "QUALCOMM": "0000804328",
-    "QCOM": "0000804328",
-    "TEXAS INSTRUMENTS": "0000097476",
-    "TXN": "0000097476",
-    "BROADCOM": "0001054374",
-    "AVGO": "0001054374",
-    "CISCO": "0000858877",
-    "CSCO": "0000858877",
-    "UBER": "0001543151",
-    "LYFT": "0001759509",
-    "AIRBNB": "0001559720",
-    "ABNB": "0001559720",
-    "SPOTIFY": "0001639920",
-    "SPOT": "0001639920",
-    "SHOPIFY": "0001594805",
-    "SHOP": "0001594805",
-    "SQUARE": "0001512673",
-    "BLOCK": "0001512673",
-    "SQ": "0001512673",
-    "TWITTER": "0001418091",
-    "TWTR": "0001418091",
-    "SNAP": "0001564408",
-    "PINTEREST": "0001506439",
-    "PINS": "0001506439",
-    "ZOOM": "0001585521",
-    "ZM": "0001585521",
-    "DOORDASH": "0001792789",
-    "DASH": "0001792789",
-    "COINBASE": "0001679788",
-    "COIN": "0001679788",
-    "ROBINHOOD": "0001783879",
-    "HOOD": "0001783879",
-    "ROBLOX": "0001315098",
-    "UNITY": "0001810806",
-    "UNITY SOFTWARE": "0001810806",
-    "U": "0001810806",
-    "RIVIAN": "0001874178",
-    "RIVN": "0001874178",
-    "LUCID": "0001840292",
-    "LCID": "0001840292",
-    "FORD": "0000037996",
-    "F": "0000037996",
-    "GM": "0001467858",
-    "GENERAL MOTORS": "0001467858",
-    "BOEING": "0000012927",
-    "BA": "0000012927",
-    "LOCKHEED MARTIN": "0000936468",
-    "LMT": "0000936468",
-    "RAYTHEON": "0000101829",
-    "RAYTHEON TECHNOLOGIES": "0000101829",
-    "RTX": "0000101829",
-    "NORTHROP GRUMMAN": "0001133421",
-    "NOC": "0001133421",
-    "GOLDMAN SACHS": "0000886982",
-    "GS": "0000886982",
-    "MORGAN STANLEY": "0000895421",
-    "MS": "0000895421",
-    "BANK OF AMERICA": "0000070858",
-    "BAC": "0000070858",
-    "WELLS FARGO": "0000072971",
-    "WFC": "0000072971",
-    "CITIGROUP": "0000831001",
-    "C": "0000831001",
-    "PROCTER & GAMBLE": "0000080424",
-    "PG": "0000080424",
-    "COCA-COLA": "0000021344",
-    "KO": "0000021344",
-    "PEPSI": "0000077476",
-    "PEPSICO": "0000077476",
-    "PEP": "0000077476",
-    "NIKE": "0000320187",
-    "NKE": "0000320187",
-    "STARBUCKS": "0000829224",
-    "SBUX": "0000829224",
-    "MCDONALDS": "0000063908",
-    "MCD": "0000063908",
-    "COSTCO": "0000909832",
-    "COST": "0000909832",
-    "TARGET": "0000027419",
-    "TGT": "0000027419",
-    "HOME DEPOT": "0000354950",
-    "HD": "0000354950",
-    "LOWE'S": "0000060667",
-    "LOW": "0000060667",
-    "CVS": "0000064803",
-    "ABBVIE": "0001551152",
-    "ABBV": "0001551152",
-    "MERCK": "0000310158",
-    "MRK": "0000310158",
-    "ELI LILLY": "0000059478",
-    "LLY": "0000059478",
-    "UNITEDHEALTH": "0000731766",
-    "UNITEDHEALTH GROUP": "0000731766",
-    "UNH": "0000731766",
-    "CATERPILLAR": "0000018230",
-    "CAT": "0000018230",
-    "DEERE": "0000315189",
-    "DE": "0000315189",
-    "HONEYWELL": "0000773840",
-    "HON": "0000773840",
-}
-
-# XBRL metric name mappings
-XBRL_METRICS = {
-    "revenue": [
-        "Revenues",
-        "RevenueFromContractWithCustomerExcludingAssessedTax",
-        "SalesRevenueNet",
-        "RevenueFromContractWithCustomerIncludingAssessedTax",
-        "SalesRevenueGoodsNet",
-    ],
-    "net_income": ["NetIncomeLoss", "NetIncome", "ProfitLoss"],
-    "capex": [
-        "PaymentsToAcquirePropertyPlantAndEquipment",
-        "CapitalExpendituresIncurredButNotYetPaid",
-        "PaymentsForCapitalImprovements",
-    ],
-    "operating_income": [
-        "OperatingIncomeLoss",
-        "IncomeLossFromContinuingOperationsBeforeIncomeTaxes",
-    ],
-    "total_assets": ["Assets"],
-    "current_assets": ["AssetsCurrent"],
-    "current_liabilities": ["LiabilitiesCurrent"],
-    "ppe_net": ["PropertyPlantAndEquipmentNet"],
-    "total_equity": [
-        "StockholdersEquity",
-        "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
-    ],
-    "long_term_debt": ["LongTermDebtNoncurrent", "LongTermDebt"],
-    "cash": [
-        "CashAndCashEquivalentsAtCarryingValue",
-        "CashAndCashEquivalents",
-        "Cash",
-    ],
-    "cash_from_ops": [
-        "NetCashProvidedByUsedInOperatingActivities",
-        "NetCashProvidedByOperatingActivities",
-    ],
-    "cogs": [
-        "CostOfGoodsSold",
-        "CostOfRevenue",
-        "CostOfGoodsAndServicesSold",
-        "CostOfGoodsSoldExcludingDepreciationDepletionAndAmortization",
-    ],
-    "gross_profit": ["GrossProfit"],
-    "r_and_d": [
-        "ResearchAndDevelopmentExpense",
-        "ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost",
-    ],
-    "eps_basic": ["EarningsPerShareBasic"],
-    "eps_diluted": ["EarningsPerShareDiluted"],
-    "shares_outstanding": [
-        "CommonStockSharesOutstanding",
-        "WeightedAverageNumberOfSharesOutstandingBasic",
-    ],
-    "inventory": ["InventoryNet", "InventoryGross"],
-    "accounts_receivable": [
-        "AccountsReceivableNetCurrent",
-        "ReceivablesNetCurrent",
-    ],
-    "accounts_payable": ["AccountsPayableCurrent"],
-    "dividends_paid": ["PaymentsOfDividends", "DividendsCommonStockCash"],
-    "depreciation": [
-        "DepreciationDepletionAndAmortization",
-        "Depreciation",
-    ],
-    "interest_expense": ["InterestExpense", "InterestExpenseDebt"],
-    "income_tax": ["IncomeTaxExpenseBenefit"],
-    "total_liabilities": ["Liabilities"],
-}
-
-
-def get_cik(company_name: str) -> Optional[str]:
-    """Get CIK for a company from hard-coded map or EDGAR lookup."""
-    name_upper = company_name.upper().strip()
-
-    # 1. Exact match first (highest priority)
-    if name_upper in COMPANY_CIK_MAP:
-        return COMPANY_CIK_MAP[name_upper]
-
-    # 2. Match where the key equals the name (case-insensitive, already upper)
-    # Avoid partial-letter matches like 'T' matching 'INTEL'
-    # Only allow substring match if key length >= 3 chars
-    best_match = None
-    best_len = 0
-    for key, cik in COMPANY_CIK_MAP.items():
-        if len(key) < 3:
-            # Short keys (tickers like 'T', 'C', 'V') must match exactly
-            if key == name_upper:
-                return cik
-        else:
-            # Longer keys: allow substring match, pick longest
-            if key == name_upper:
-                return cik
-            if name_upper in key and len(key) > best_len:
-                best_match = cik
-                best_len = len(key)
-            elif key in name_upper and len(key) > best_len:
-                best_match = cik
-                best_len = len(key)
-
-    if best_match:
-        return best_match
-
-    # 3. Try loaded tickers (exact match)
-    tickers = load_company_tickers()
-    if name_upper in tickers:
-        return tickers[name_upper]
-
-    # 4. Fuzzy match against ticker list (only keys >= 3 chars)
-    for key, cik in tickers.items():
-        if len(key) >= 3 and (name_upper in key or key in name_upper):
-            return cik
+        log.warning(f"Failed to fetch FRASER document {url}: {e}")
 
     return None
 
 
-def fetch_edgar_facts(cik: str) -> Optional[Dict]:
-    """Fetch all XBRL facts for a company from SEC EDGAR."""
-    cache_key = f"facts_{cik}"
-    if cache_key in _edgar_cache:
-        return _edgar_cache[cache_key]
+def extract_pdf_url(html: str, base_url: str) -> Optional[str]:
+    """Extract PDF download URL from FRASER page HTML."""
+    # Look for PDF download links in FRASER HTML
+    patterns = [
+        r'href="(/files/docs/[^"]+\.pdf)"',
+        r'href="(/download/[^"]+)"',
+        r'"pdfUrl"\s*:\s*"([^"]+)"',
+        r'href="([^"]+\.pdf)"',
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, html, re.IGNORECASE)
+        if m:
+            href = m.group(1)
+            if href.startswith("http"):
+                return href
+            elif href.startswith("/"):
+                return f"{FRASER_BASE}{href}"
+    return None
 
+
+def fetch_pdf_text(pdf_url: str) -> Optional[str]:
+    """
+    Fetch PDF from URL and extract text.
+    Uses pdfminer if available, otherwise returns None.
+    """
     try:
-        url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
-        req = urllib.request.Request(url, headers={"User-Agent": EDGAR_USER_AGENT})
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            data = json.loads(resp.read())
-            gaap = data.get("facts", {}).get("us-gaap", {})
-            dei = data.get("facts", {}).get("dei", {})
-            result = {"gaap": gaap, "dei": dei, "company": data.get("entityName", "")}
-            _edgar_cache[cache_key] = result
-            log.info(f"Fetched EDGAR facts for CIK {cik}: {result['company']}")
-            return result
+        import pdfminer.high_level
+        import io
+
+        headers = {
+            "User-Agent": "AutoPilotAI/3.0 (alex-chen@79661d.inboxapi.ai)"
+        }
+        req = urllib.request.Request(pdf_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            pdf_bytes = resp.read()
+
+        text = pdfminer.high_level.extract_text(io.BytesIO(pdf_bytes))
+        log.info(f"Extracted {len(text)} chars from PDF: {pdf_url}")
+        return text
+
+    except ImportError:
+        log.warning("pdfminer not available, cannot extract PDF text")
+        return None
     except Exception as e:
-        log.warning(f"Failed to fetch EDGAR facts for {cik}: {e}")
+        log.warning(f"Failed to extract PDF text from {pdf_url}: {e}")
         return None
 
 
-def get_metric_value(
-    facts: Dict,
-    metric_keys: List[str],
-    fiscal_year: Optional[int] = None,
-    period: str = "annual",
-    quarter: Optional[int] = None,
-    pick_latest: bool = False,
-) -> Optional[Tuple[float, str, str]]:
+def extract_text_from_html(html: str) -> str:
+    """Extract plain text from HTML content."""
+    # Remove script/style tags
+    html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL)
+    html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL)
+    # Remove HTML tags
+    text = re.sub(r'<[^>]+>', ' ', html)
+    # Clean up whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+# ============================================================
+# LLM-BASED ANSWER EXTRACTION
+# ============================================================
+
+def extract_answer_with_llm(question: str, document_text: str, source_url: str = "") -> str:
     """
-    Get a specific metric value from EDGAR facts.
-    Returns (value, period_end, form_type) or None.
+    Use LLM to extract the answer from document text.
+    This is the core reasoning component.
     """
-    gaap = facts.get("gaap", {})
+    if not HAS_LITELLM or not LLM_API_KEY:
+        return extract_answer_heuristic(question, document_text)
 
-    for key in metric_keys:
-        if key not in gaap:
-            continue
+    # Truncate document to fit context (keep most relevant parts)
+    max_doc_chars = 60000
+    if len(document_text) > max_doc_chars:
+        # Try to find the most relevant section
+        doc_excerpt = find_relevant_section(question, document_text, max_doc_chars)
+    else:
+        doc_excerpt = document_text
 
-        units = gaap[key].get("units", {})
-        # Use USD, shares, pure, or USD/shares (Apple EPS format)
-        data_points = units.get("USD", units.get("shares", units.get("pure", units.get("USD/shares", []))))
+    prompt = f"""You are analyzing a US Treasury Bulletin document to answer a specific question.
 
-        if not data_points:
-            continue
+Question: {question}
 
-        # Filter by form type
-        if period == "annual":
-            form_filter = "10-K"
-        elif period == "quarterly":
-            form_filter = "10-Q"
-        else:
-            form_filter = None
+Document content (from {source_url}):
+---
+{doc_excerpt}
+---
 
-        filtered = []
-        for dp in data_points:
-            if form_filter and dp.get("form") != form_filter:
-                continue
+Instructions:
+1. Find the specific value or data requested in the question
+2. Look carefully in tables, figures, and text for the exact number
+3. If computation is needed, show your work step by step
+4. Return ONLY the final numeric answer in the exact format expected
+5. For dollar amounts: use format like "$1,234.5 million" or "$1.2 billion"
+6. For percentages: use format like "5.3%" or "5.3 percent"
+7. For plain numbers: use format like "1,234" or "1234"
+8. If the answer is not found, return "NOT_FOUND"
 
-            if fiscal_year:
-                end_year = int(str(dp.get("end", "0"))[:4])
-                if period == "annual" and end_year != fiscal_year:
-                    continue
-                if period == "quarterly" and dp.get("fy") != fiscal_year:
-                    continue
-                if quarter and dp.get("fp") != f"Q{quarter}":
-                    continue
+Final answer:"""
 
-            filtered.append(dp)
+    try:
+        import litellm
+        response = litellm.completion(
+            model=LLM_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            api_key=LLM_API_KEY,
+            max_tokens=500,
+            temperature=0
+        )
+        answer = response.choices[0].message.content.strip()
+        log.info(f"LLM answer: {answer[:100]}")
+        return answer
+    except Exception as e:
+        log.warning(f"LLM call failed: {e}")
+        return extract_answer_heuristic(question, document_text)
 
-        if not filtered:
-            continue
 
-        if pick_latest:
-            # Pick the most recently filed entry
-            filtered.sort(key=lambda x: x.get("filed", ""), reverse=True)
-            dp = filtered[0]
-        elif filtered:
-            # Prefer the one with a matching fiscal year period
-            annual_fps = [x for x in filtered if x.get("fp") == "FY"]
-            if annual_fps:
-                annual_fps.sort(key=lambda x: x.get("filed", ""), reverse=True)
-                dp = annual_fps[0]
-            else:
-                filtered.sort(key=lambda x: x.get("end", ""), reverse=True)
-                dp = filtered[0]
+def find_relevant_section(question: str, text: str, max_chars: int) -> str:
+    """Find the most relevant section of a document for a given question."""
+    # Extract key terms from question
+    # Remove common words
+    stop_words = {'what', 'was', 'the', 'of', 'in', 'for', 'a', 'an', 'and', 'or',
+                  'how', 'much', 'total', 'is', 'are', 'were', 'did', 'does', 'do',
+                  'to', 'from', 'at', 'by', 'with', 'that', 'this', 'which', 'these'}
 
-        return (dp["val"], dp.get("end", ""), dp.get("form", ""))
+    words = re.findall(r'\b\w+\b', question.lower())
+    key_terms = [w for w in words if w not in stop_words and len(w) > 2]
+
+    # Split text into chunks
+    chunk_size = 2000
+    chunks = []
+    for i in range(0, len(text), chunk_size):
+        chunks.append((i, text[i:i+chunk_size]))
+
+    # Score each chunk by keyword matches
+    scored = []
+    for pos, chunk in chunks:
+        score = sum(chunk.lower().count(term) for term in key_terms)
+        scored.append((score, pos, chunk))
+
+    # Sort by score, take top chunks
+    scored.sort(reverse=True)
+    selected = sorted(scored[:max_chars // chunk_size + 1], key=lambda x: x[1])
+
+    return " ... ".join(c for _, _, c in selected)[:max_chars]
+
+
+def extract_answer_heuristic(question: str, document_text: str) -> str:
+    """
+    Heuristic-based answer extraction when LLM is not available.
+    Looks for numbers near keywords from the question.
+    """
+    q_lower = question.lower()
+    # Extract key numeric patterns from document
+    # Find context around numbers with dollar signs
+    dollar_pattern = r'\$[\d,]+(?:\.\d+)?\s*(?:million|billion|thousand)?'
+    number_pattern = r'\b\d{1,3}(?:,\d{3})*(?:\.\d+)?\b'
+
+    # Find numbers in the document
+    dollars = re.findall(dollar_pattern, document_text, re.IGNORECASE)
+    numbers = re.findall(number_pattern, document_text)
+
+    # Return the first significant number found (heuristic fallback)
+    if dollars:
+        return dollars[0]
+    if numbers:
+        return numbers[0]
+
+    return "NOT_FOUND"
+
+
+# ============================================================
+# MULTI-STEP REASONING FOR COMPUTATIONS
+# ============================================================
+
+def solve_computation(question: str, extracted_values: Dict[str, float]) -> Optional[str]:
+    """
+    Perform multi-step computations based on extracted values.
+    Handles common Treasury Bulletin calculations.
+    """
+    q_lower = question.lower()
+
+    # Percentage change
+    if any(kw in q_lower for kw in ["percent change", "% change", "growth rate", "increase", "decrease"]):
+        values = list(extracted_values.values())
+        if len(values) >= 2:
+            old_val, new_val = sorted(values)[:2]
+            if old_val != 0:
+                pct = ((new_val - old_val) / abs(old_val)) * 100
+                return f"{pct:.1f}%"
+
+    # Ratio
+    if any(kw in q_lower for kw in ["ratio", "proportion", "share"]):
+        values = list(extracted_values.values())
+        if len(values) >= 2:
+            ratio = values[0] / values[1]
+            return f"{ratio:.2f}"
+
+    # Sum/total
+    if any(kw in q_lower for kw in ["total", "sum", "combined"]):
+        total = sum(extracted_values.values())
+        return f"{total:,.0f}"
 
     return None
+
+
+# ============================================================
+# MAIN TASK HANDLER
+# ============================================================
+
+def process_finance_question(question: str, source_docs: List[str] = None) -> str:
+    """
+    Main entry point: process a finance question from the OfficeQA benchmark.
+
+    Args:
+        question: The question to answer
+        source_docs: Optional list of source document URLs from FRASER
+
+    Returns:
+        The answer string
+    """
+    log.info(f"Processing question: {question[:100]}")
+    log.info(f"Source docs: {source_docs}")
+
+    # Strategy 1: If source docs provided, fetch and analyze them
+    if source_docs:
+        for doc_url in source_docs:
+            text = fetch_fraser_document(doc_url)
+            if text and len(text) > 100:
+                answer = extract_answer_with_llm(question, text, doc_url)
+                if answer and answer != "NOT_FOUND":
+                    log.info(f"Answer from source doc: {answer}")
+                    return answer
+
+    # Strategy 2: Search FRASER for relevant Treasury Bulletin
+    # Extract date/year from question to find the right bulletin
+    year = extract_year_from_question(question)
+    month = extract_month_from_question(question)
+
+    if year:
+        bulletin_url = find_treasury_bulletin(year, month)
+        if bulletin_url:
+            text = fetch_fraser_document(bulletin_url)
+            if text and len(text) > 100:
+                answer = extract_answer_with_llm(question, text, bulletin_url)
+                if answer and answer != "NOT_FOUND":
+                    return answer
+
+    # Strategy 3: Use LLM with question only (no document - lower quality fallback)
+    if HAS_LITELLM and LLM_API_KEY:
+        answer = answer_with_llm_only(question)
+        if answer:
+            return answer
+
+    return "NOT_FOUND"
+
+
+def find_treasury_bulletin(year: int, month: str = None) -> Optional[str]:
+    """
+    Construct FRASER URL for a Treasury Bulletin by year/month.
+    Format: https://fraser.stlouisfed.org/title/treasury-bulletin-407/{month}-{year}-{id}
+    """
+    month_map = {
+        "january": "january", "february": "february", "march": "march",
+        "april": "april", "may": "may", "june": "june",
+        "july": "july", "august": "august", "september": "september",
+        "october": "october", "november": "november", "december": "december",
+    }
+
+    if month:
+        month_clean = month.lower().strip()
+        if month_clean in month_map:
+            # Try to find the specific bulletin
+            search_url = f"{FRASER_BASE}/title/treasury-bulletin-407"
+            return search_url
+
+    return f"{FRASER_BASE}/title/treasury-bulletin-407"
 
 
 def extract_year_from_question(question: str) -> Optional[int]:
-    """Extract fiscal year from question."""
-    q = question.lower()
-    # Common patterns: FY2022, FY22, 2022, fiscal year 2022
-    patterns = [
-        r"fy\s*20(\d{2})",  # FY2022 -> 2022
-        r"fy\s*(\d{2})(?:\s|$|[^0-9])",  # FY22 -> could be 2022
-        r"fiscal\s+(?:year\s+)?20(\d{2})",
-        r"20(\d{2})\s+(?:annual|fiscal|year)",
-        r"(?:q[1-4]|q[1-4]\s+of)\s+(?:fy)?20(\d{2})",
-    ]
-
-    for p in patterns:
-        m = re.search(p, q)
-        if m:
-            yr = int(m.group(1))
-            if yr < 100:
-                yr += 2000
-            return yr
-
-    # Plain year mention
-    years = re.findall(r"\b(20[12][0-9])\b", question)
+    """Extract year from question text."""
+    # Four-digit year
+    years = re.findall(r'\b(1[89][0-9]{2}|20[0-2][0-9])\b', question)
     if years:
         return int(years[0])
-
+    # Two-digit year after apostrophe
+    years = re.findall(r"'(\d{2})\b", question)
+    if years:
+        yr = int(years[0])
+        return yr + 1900 if yr >= 39 else yr + 2000
     return None
 
 
-def extract_quarter_from_question(question: str) -> Optional[int]:
-    """Extract quarter from question."""
-    m = re.search(r"\bq([1-4])\b", question.lower())
-    if m:
-        return int(m.group(1))
-    return None
-
-
-def extract_company_from_question(question: str) -> Optional[str]:
-    """Extract company name from question."""
-    # Check against known companies (longest match wins)
-    # Use word-boundary matching to avoid 'T' matching words containing 't'
-    matches = []
+def extract_month_from_question(question: str) -> Optional[str]:
+    """Extract month from question text."""
+    months = ["january", "february", "march", "april", "may", "june",
+              "july", "august", "september", "october", "november", "december",
+              "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
     q_lower = question.lower()
-
-    for key in COMPANY_CIK_MAP:
-        k_lower = key.lower()
-        if len(k_lower) < 3:
-            # Short tickers: require word boundary match
-            if re.search(r'\b' + re.escape(k_lower) + r'\b', q_lower):
-                matches.append(key)
-        else:
-            # Longer names: simple substring match is fine
-            if k_lower in q_lower:
-                matches.append(key)
-
-    if matches:
-        # Return longest match
-        return max(matches, key=len)
-
+    for m in months:
+        if m in q_lower:
+            return m
     return None
 
 
-# ============================================================
-# EDGAR-BASED ANSWER GENERATION
-# ============================================================
-
-def answer_from_edgar(question: str, company: str, fy: Optional[int], quarter: Optional[int] = None) -> Optional[str]:
-    """Try to answer a financial question using SEC EDGAR XBRL data."""
-    cik = get_cik(company)
-    if not cik:
-        log.info(f"No CIK found for {company}")
+def answer_with_llm_only(question: str) -> Optional[str]:
+    """Use LLM knowledge directly for Treasury Bulletin questions."""
+    if not HAS_LITELLM or not LLM_API_KEY:
         return None
 
-    facts = fetch_edgar_facts(cik)
-    if not facts:
-        return None
+    prompt = f"""You are an expert on US Treasury Bulletins published by the US Department of the Treasury from 1939 to 2025. 
 
-    company_name = facts.get("company", company)
-    q_lower = question.lower()
+These bulletins contain detailed financial statistics about US government debt, interest rates, savings bonds, government accounts, and Treasury operations.
 
-    def get_val(metric_type: str, year: int = None, prd: str = "annual", q: int = None) -> Optional[float]:
-        keys = XBRL_METRICS.get(metric_type, [])
-        result = get_metric_value(facts, keys, fiscal_year=year, period=prd, quarter=q)
-        if result:
-            return result[0]
-        return None
+Question: {question}
 
-    # ===== CAPEX =====
-    if any(kw in q_lower for kw in ["capital expenditure", "capex", "payments to acquire property"]):
-        if fy:
-            v = get_val("capex", fy)
-            if v is not None:
-                if "million" in q_lower or "USD millions" in q_lower:
-                    return f"${v/1e6:.2f}"
-                elif "billion" in q_lower:
-                    return f"${v/1e9:.2f}B"
-                else:
-                    return f"${v/1e6:.2f} million"
+Based on your knowledge of US Treasury Bulletin data and US government financial history, provide the most accurate answer. Return ONLY the numeric answer in the exact format that would appear in the Treasury Bulletin (e.g., dollar amounts in millions, percentages, etc.).
 
-    # ===== NET PPNE / FIXED ASSETS =====
-    # Note: exclude "fixed asset turnover" - that is a ratio, handled separately below
-    if any(kw in q_lower for kw in ["ppne", "net ppe", "property plant", "net pp&e"]) or \
-       ("fixed asset" in q_lower and "turnover" not in q_lower):
-        if fy:
-            v = get_val("ppe_net", fy)
-            if v is not None:
-                if "billion" in q_lower:
-                    return f"${v/1e9:.2f}B"
-                elif "million" in q_lower:
-                    return f"${v/1e6:.2f}M"
-                else:
-                    return f"${v/1e9:.2f} billion"
+If you cannot determine the answer with confidence, return "NOT_FOUND".
 
-    # ===== REVENUE =====
-    if any(kw in q_lower for kw in ["revenue", "sales", "net sales", "total revenue"]):
-        if fy:
-            v = get_val("revenue", fy)
-            if v is not None:
-                if "million" in q_lower:
-                    return f"${v/1e6:.2f}M"
-                elif "billion" in q_lower:
-                    return f"${v/1e9:.2f}B"
-                else:
-                    return f"${v/1e9:.2f}B"
+Answer:"""
 
-    # ===== NET INCOME =====
-    if any(kw in q_lower for kw in ["net income", "net profit", "net earnings"]):
-        if fy:
-            v = get_val("net_income", fy)
-            if v is not None:
-                if "million" in q_lower:
-                    return f"${v/1e6:.2f}M"
-                elif "billion" in q_lower:
-                    return f"${v/1e9:.2f}B"
-                else:
-                    return f"${v/1e6:.2f}M"
-
-    # ===== OPERATING INCOME =====
-    if any(kw in q_lower for kw in ["operating income", "operating profit", "ebit"]):
-        if fy:
-            v = get_val("operating_income", fy)
-            if v is not None:
-                if "million" in q_lower:
-                    return f"${v/1e6:.2f}M"
-                else:
-                    return f"${v/1e9:.2f}B"
-
-    # ===== EPS =====
-    if any(kw in q_lower for kw in ["earnings per share", "eps", "diluted eps", "basic eps"]):
-        if fy:
-            if "diluted" in q_lower:
-                v = get_val("eps_diluted", fy)
-            else:
-                v = get_val("eps_basic", fy)
-            if v is None:
-                v = get_val("eps_diluted", fy)
-            if v is not None:
-                return f"${v:.2f}"
-
-    # ===== TOTAL ASSETS =====
-    if any(kw in q_lower for kw in ["total assets", "assets"]) and "current" not in q_lower:
-        if fy:
-            v = get_val("total_assets", fy)
-            if v is not None:
-                if "billion" in q_lower:
-                    return f"${v/1e9:.2f}B"
-                elif "million" in q_lower:
-                    return f"${v/1e6:.2f}M"
-                else:
-                    return f"${v/1e9:.2f}B"
-
-    # ===== CURRENT RATIO =====
-    if "current ratio" in q_lower:
-        if fy:
-            ca = get_val("current_assets", fy)
-            cl = get_val("current_liabilities", fy)
-            if ca and cl:
-                ratio = FINANCIAL_FORMULAS["current_ratio"](ca, cl)
-                return str(ratio)
-
-    # ===== QUICK RATIO =====
-    if "quick ratio" in q_lower:
-        if fy:
-            ca = get_val("current_assets", fy)
-            inv = get_val("inventory", fy) or 0
-            cl = get_val("current_liabilities", fy)
-            if ca and cl:
-                ratio = FINANCIAL_FORMULAS["quick_ratio"](ca, inv, cl)
-                return str(ratio)
-
-    # ===== DEBT TO EQUITY =====
-    if "debt to equity" in q_lower or "leverage" in q_lower:
-        if fy:
-            debt = get_val("long_term_debt", fy)
-            equity = get_val("total_equity", fy)
-            if debt and equity:
-                ratio = FINANCIAL_FORMULAS["debt_to_equity"](debt, equity)
-                return str(ratio)
-
-    # ===== GROSS MARGIN =====
-    if "gross margin" in q_lower:
-        if fy:
-            rev = get_val("revenue", fy)
-            cogs = get_val("cogs", fy)
-            gp = get_val("gross_profit", fy)
-            if gp and rev:
-                gm = FINANCIAL_FORMULAS["gross_margin"](rev, rev - gp)
-                return f"{gm:.1f}%"
-            elif rev and cogs:
-                gm = FINANCIAL_FORMULAS["gross_margin"](rev, cogs)
-                return f"{gm:.1f}%"
-
-    # ===== OPERATING MARGIN =====
-    if "operating margin" in q_lower:
-        if fy:
-            rev = get_val("revenue", fy)
-            op_inc = get_val("operating_income", fy)
-            if rev and op_inc:
-                om = FINANCIAL_FORMULAS["operating_margin"](op_inc, rev)
-                return f"{om:.1f}%"
-
-    # ===== NET MARGIN =====
-    if "net margin" in q_lower or "profit margin" in q_lower:
-        if fy:
-            rev = get_val("revenue", fy)
-            ni = get_val("net_income", fy)
-            if rev and ni:
-                nm = FINANCIAL_FORMULAS["net_margin"](ni, rev)
-                return f"{nm:.1f}%"
-
-    # ===== INVENTORY TURNOVER =====
-    if "inventory turnover" in q_lower:
-        if fy:
-            cogs = get_val("cogs", fy)
-            inv = get_val("inventory", fy)
-            if cogs and inv:
-                it = FINANCIAL_FORMULAS["inventory_turnover"](cogs, inv)
-                return f"{it:.1f}"
-
-    # ===== FIXED ASSET TURNOVER =====
-    if "fixed asset turnover" in q_lower:
-        if fy:
-            rev = get_val("revenue", fy)
-            ppe = get_val("ppe_net", fy)
-            if rev and ppe:
-                fat = FINANCIAL_FORMULAS["fixed_asset_turnover"](rev, ppe)
-                return f"{fat:.2f}"
-
-    # ===== DAYS PAYABLE OUTSTANDING =====
-    if "days payable" in q_lower or "dpo" in q_lower:
-        if fy:
-            ap_curr = get_val("accounts_payable", fy)
-            ap_prev = get_val("accounts_payable", fy - 1)
-            cogs = get_val("cogs", fy)
-            if ap_curr and cogs:
-                avg_ap = ((ap_curr + (ap_prev or ap_curr)) / 2) if ap_prev else ap_curr
-                dpo = FINANCIAL_FORMULAS["dpo"](avg_ap, cogs)
-                return f"{dpo:.2f}"
-
-    # ===== DAYS SALES OUTSTANDING =====
-    if "days sales outstanding" in q_lower or "dso" in q_lower:
-        if fy:
-            ar = get_val("accounts_receivable", fy)
-            rev = get_val("revenue", fy)
-            if ar and rev:
-                dso = FINANCIAL_FORMULAS["dso"](ar, rev)
-                return f"{dso:.2f}"
-
-    # ===== ROA =====
-    if "return on assets" in q_lower or "roa" in q_lower:
-        if fy:
-            ni = get_val("net_income", fy)
-            assets = get_val("total_assets", fy)
-            if ni and assets:
-                roa = FINANCIAL_FORMULAS["return_on_assets"](ni, assets)
-                return f"{roa:.1f}%"
-
-    # ===== ROE =====
-    if "return on equity" in q_lower or "roe" in q_lower:
-        if fy:
-            ni = get_val("net_income", fy)
-            equity = get_val("total_equity", fy)
-            if ni and equity:
-                roe = FINANCIAL_FORMULAS["return_on_equity"](ni, equity)
-                return f"{roe:.1f}%"
-
-    # ===== R&D EXPENSE =====
-    if any(kw in q_lower for kw in ["r&d", "research and development", "r and d"]):
-        if fy:
-            v = get_val("r_and_d", fy)
-            if v is not None:
-                if "million" in q_lower:
-                    return f"${v/1e6:.2f}M"
-                else:
-                    return f"${v/1e9:.2f}B"
-
-    # ===== CASH FROM OPERATIONS =====
-    if any(kw in q_lower for kw in ["cash from operations", "operating cash flow", "cash provided by"]):
-        if fy:
-            v = get_val("cash_from_ops", fy)
-            if v is not None:
-                if "million" in q_lower:
-                    return f"${v/1e6:.2f}M"
-                else:
-                    return f"${v/1e9:.2f}B"
-
-    # ===== CAPEX AS % OF REVENUE =====
-    if "capex" in q_lower and "revenue" in q_lower and "%" in q_lower:
-        if fy:
-            capex = get_val("capex", fy)
-            rev = get_val("revenue", fy)
-            if capex and rev:
-                pct = FINANCIAL_FORMULAS["capex_pct_revenue"](capex, rev)
-                return f"{pct:.1f}%"
-
-    # ===== YEAR-OVER-YEAR CHANGE =====
-    if any(kw in q_lower for kw in ["year-over-year", "yoy", "year over year", "change"]):
-        if fy:
-            # Determine metric
-            for metric_name, kws in [
-                ("revenue", ["revenue", "sales"]),
-                ("operating_income", ["operating income", "operating profit"]),
-                ("net_income", ["net income"]),
-                ("gross_profit", ["gross profit"]),
-            ]:
-                if any(k in q_lower for k in kws):
-                    curr = get_val(metric_name, fy)
-                    prev = get_val(metric_name, fy - 1)
-                    if curr and prev:
-                        change = ((curr - prev) / abs(prev)) * 100
-                        return f"{change:.1f}%"
-
-    # ===== CAGR OVER MULTIPLE YEARS =====
-    if "cagr" in q_lower or "compound annual" in q_lower:
-        years_match = re.search(r"(\d+)\s*[\-\s]year", q_lower)
-        if years_match and fy:
-            n_years = int(years_match.group(1))
-            # Determine metric
-            for metric_name, kws in [
-                ("revenue", ["revenue", "sales"]),
-                ("net_income", ["net income"]),
-                ("capex", ["capex", "capital"]),
-            ]:
-                if any(k in q_lower for k in kws):
-                    curr = get_val(metric_name, fy)
-                    prev = get_val(metric_name, fy - n_years)
-                    if curr and prev:
-                        cagr = FINANCIAL_FORMULAS["cagr"](prev, curr, n_years)
-                        return f"{cagr:.1f}%"
-
-    # ===== 3-YEAR AVERAGE =====
-    if "3 year average" in q_lower or "three year average" in q_lower:
-        if fy:
-            for metric_name, kws in [
-                ("capex", ["capex", "capital expenditure"]),
-                ("revenue", ["revenue"]),
-                ("r_and_d", ["r&d", "research"]),
-            ]:
-                if any(k in q_lower for k in kws):
-                    vals = []
-                    for y in range(fy - 2, fy + 1):
-                        v = get_val(metric_name, y)
-                        if v:
-                            vals.append(v)
-                    if len(vals) >= 2:
-                        avg = sum(vals) / len(vals)
-                        # If asking as % of revenue
-                        if "% of revenue" in q_lower or "percent" in q_lower:
-                            rev_vals = []
-                            for y in range(fy - 2, fy + 1):
-                                rv = get_val("revenue", y)
-                                if rv:
-                                    rev_vals.append(rv)
-                            if rev_vals:
-                                rev_avg = sum(rev_vals) / len(rev_vals)
-                                pct = (avg / rev_avg) * 100
-                                return f"{pct:.1f}%"
-                        if "million" in q_lower:
-                            return f"${avg/1e6:.2f}M"
-                        else:
-                            return f"${avg/1e9:.2f}B"
-
-    # ===== CAPITAL INTENSITY / CAPEX-BASED ANALYSIS =====
-    if "capital-intensive" in q_lower or "capital intensive" in q_lower:
-        if fy:
-            capex = get_val("capex", fy)
-            rev = get_val("revenue", fy)
-            ppe = get_val("ppe_net", fy)
-            assets = get_val("total_assets", fy)
-            ni = get_val("net_income", fy)
-
-            parts = []
-            if capex and rev:
-                pct = (capex / rev) * 100
-                parts.append(f"CAPEX/Revenue: {pct:.1f}%")
-            if ppe and assets:
-                pct2 = (ppe / assets) * 100
-                parts.append(f"Fixed Assets/Total Assets: {pct2:.0f}%")
-            if ni and assets:
-                roa = (ni / assets) * 100
-                parts.append(f"Return on Assets: {roa:.1f}%")
-
-            if parts:
-                threshold_capex = (capex / rev * 100) if capex and rev else 0
-                is_capital_intensive = threshold_capex > 10  # >10% is typically capital intensive
-                verdict = "Yes" if is_capital_intensive else "No"
-                metrics_str = "\n".join(parts)
-                return (
-                    f"{verdict}, {company_name} is {'a capital-intensive' if is_capital_intensive else 'not a capital-intensive'} business. "
-                    f"Key metrics:\n{metrics_str}"
-                )
-
-    # ===== FREE CASH FLOW =====
-    if "free cash flow" in q_lower or "fcf" in q_lower:
-        if fy:
-            cfo = get_val("cash_from_ops", fy)
-            capex = get_val("capex", fy)
-            if cfo is not None and capex is not None:
-                fcf = FINANCIAL_FORMULAS["fcf"](cfo, capex)
-                if "million" in q_lower:
-                    return f"${fcf/1e6:.2f}M"
-                else:
-                    return f"${fcf/1e9:.2f}B"
-
-    # ===== FREE CASH FLOW CONVERSION =====
-    if "fcf conversion" in q_lower or "free cashflow conversion" in q_lower:
-        if fy:
-            cfo = get_val("cash_from_ops", fy)
-            capex = get_val("capex", fy)
-            ni = get_val("net_income", fy)
-            if cfo and capex and ni:
-                fcf = cfo - capex
-                pct = (fcf / ni) * 100
-                return f"{pct:.0f}%"
-
-    return None
-
-
-# ============================================================
-# YFINANCE FALLBACK
-# ============================================================
-
-def fetch_yfinance_data(ticker: str) -> Optional[Dict]:
-    """Fetch financial data via yfinance."""
-    if not HAS_YFINANCE:
-        return None
     try:
-        stock = yf.Ticker(ticker)
-        info = stock.info
-        if not info or info.get("regularMarketPrice") is None:
-            return None
-        return {
-            "ticker": ticker,
-            "price": info.get("regularMarketPrice"),
-            "pe_ratio": info.get("trailingPE"),
-            "forward_pe": info.get("forwardPE"),
-            "eps": info.get("trailingEps"),
-            "market_cap": info.get("marketCap"),
-            "revenue_ttm": info.get("totalRevenue"),
-            "net_income_ttm": info.get("netIncomeToCommon"),
-            "gross_margins": info.get("grossMargins"),
-            "operating_margins": info.get("operatingMargins"),
-            "profit_margins": info.get("profitMargins"),
-            "beta": info.get("beta"),
-            "book_value": info.get("bookValue"),
-            "price_to_book": info.get("priceToBook"),
-            "revenue_growth": info.get("revenueGrowth"),
-            "earnings_growth": info.get("earningsGrowth"),
-            "company_name": info.get("longName"),
-            "sector": info.get("sector"),
-        }
+        import litellm
+        response = litellm.completion(
+            model=LLM_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            api_key=LLM_API_KEY,
+            max_tokens=200,
+            temperature=0
+        )
+        answer = response.choices[0].message.content.strip()
+        log.info(f"LLM-only answer: {answer[:100]}")
+        return answer if answer != "NOT_FOUND" else None
     except Exception as e:
-        log.debug(f"yfinance fetch failed for {ticker}: {e}")
-    return None
+        log.warning(f"LLM-only call failed: {e}")
+        return None
 
 
 # ============================================================
-# TICKER EXTRACTION
+# A2A PROTOCOL HANDLER
 # ============================================================
 
-TICKER_MAP = {
-    "Netflix": "NFLX",
-    "Apple": "AAPL",
-    "Microsoft": "MSFT",
-    "Google": "GOOGL",
-    "Alphabet": "GOOGL",
-    "Amazon": "AMZN",
-    "Tesla": "TSLA",
-    "Meta": "META",
-    "Facebook": "META",
-    "NVIDIA": "NVDA",
-    "AMD": "AMD",
-    "Intel": "INTC",
-    "JPMorgan": "JPM",
-    "Goldman Sachs": "GS",
-    "Morgan Stanley": "MS",
-    "Walmart": "WMT",
-    "Target": "TGT",
-    "Johnson & Johnson": "JNJ",
-    "Pfizer": "PFE",
-    "Exxon": "XOM",
-    "Chevron": "CVX",
-    "US Steel": "X",
-    "TJX": "TJX",
-    "TJX Companies": "TJX",
-    "BBSI": "BBSI",
-    "Palantir": "PLTR",
-    "Snowflake": "SNOW",
-    "Berkshire Hathaway": "BRK-B",
-    "Disney": "DIS",
-    "AT&T": "T",
-    "Verizon": "VZ",
-    "PayPal": "PYPL",
-    "Visa": "V",
-    "Mastercard": "MA",
-    "3M": "MMM",
-    "Activision": "ATVI",
-    "Adobe": "ADBE",
-    "AES": "AES",
+def parse_a2a_task(body: Dict) -> Tuple[str, List[str]]:
+    """
+    Parse an A2A task message to extract question and source documents.
+    Handles various A2A message formats.
+
+    Returns: (question, source_docs)
+    """
+    question = ""
+    source_docs = []
+
+    # Format 1: Direct text message
+    if "message" in body:
+        msg = body["message"]
+        if isinstance(msg, str):
+            question = msg
+        elif isinstance(msg, dict):
+            # A2A message object
+            parts = msg.get("parts", [])
+            for part in parts:
+                if part.get("type") == "text":
+                    question += part.get("text", "")
+                elif part.get("type") == "data":
+                    data = part.get("data", {})
+                    if "question" in data:
+                        question = data["question"]
+                    if "source_docs" in data:
+                        source_docs = data["source_docs"]
+                    if "source_urls" in data:
+                        source_docs = data["source_urls"]
+
+    # Format 2: Direct fields
+    if not question and "question" in body:
+        question = body["question"]
+    if not source_docs and "source_docs" in body:
+        source_docs = body["source_docs"]
+    if not source_docs and "source_urls" in body:
+        source_docs = body["source_urls"]
+
+    # Format 3: JSON-RPC method call
+    if "method" in body and "params" in body:
+        params = body["params"]
+        if isinstance(params, dict):
+            question = params.get("question", params.get("message", ""))
+            source_docs = params.get("source_docs", params.get("source_urls", []))
+        elif isinstance(params, list) and params:
+            first_param = params[0]
+            if isinstance(first_param, str):
+                question = first_param
+            elif isinstance(first_param, dict):
+                question = first_param.get("question", first_param.get("message", ""))
+                source_docs = first_param.get("source_docs", [])
+
+    # Extract FRASER URLs from question if not provided
+    if not source_docs:
+        fraser_urls = re.findall(r'https://fraser\.stlouisfed\.org/[^\s"\']+', question)
+        source_docs = fraser_urls
+
+    return question.strip(), source_docs
+
+
+def format_a2a_response(answer: str, task_id: str = None) -> Dict:
+    """Format response in A2A protocol format."""
+    return {
+        "id": task_id or str(uuid.uuid4()),
+        "status": {
+            "state": "completed"
+        },
+        "artifacts": [
+            {
+                "parts": [
+                    {
+                        "type": "text",
+                        "text": answer
+                    }
+                ]
+            }
+        ],
+        "result": answer,
+        "answer": answer,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
+
+# ============================================================
+# AGENT CARD (A2A DISCOVERY)
+# ============================================================
+
+AGENT_CARD = {
+    "name": "AutoPilotAI Finance Agent",
+    "description": "OfficeQA-compatible finance agent specializing in US Treasury Bulletin analysis. Answers grounded reasoning questions over Treasury documents spanning 1939-2025 via FRASER archive retrieval and LLM-based extraction.",
+    "url": "https://agentbeats-finance.chitacloud.dev",
+    "version": AGENT_VERSION,
+    "defaultInputModes": ["text/plain", "application/json"],
+    "defaultOutputModes": ["text/plain", "application/json"],
+    "capabilities": {
+        "streaming": False,
+        "pushNotifications": False,
+        "stateTransitionHistory": False
+    },
+    "skills": [
+        {
+            "id": "treasury-bulletin-qa",
+            "name": "Treasury Bulletin QA",
+            "description": "Answer questions about US Treasury Bulletins using document retrieval and extraction from FRASER archive",
+            "tags": ["finance", "treasury", "document-qa", "grounded-reasoning"],
+            "inputModes": ["text/plain"],
+            "outputModes": ["text/plain"]
+        },
+        {
+            "id": "financial-computation",
+            "name": "Financial Computation",
+            "description": "Multi-step financial computations from extracted document values",
+            "tags": ["finance", "computation", "arithmetic"],
+            "inputModes": ["text/plain"],
+            "outputModes": ["text/plain"]
+        }
+    ]
 }
 
 
-def extract_ticker(question: str) -> Optional[str]:
-    """Extract stock ticker from question."""
-    ticker_match = re.search(r"NASDAQ:\s*([A-Z]+)|NYSE:\s*([A-Z]+)", question)
-    if ticker_match:
-        for group in ticker_match.groups():
-            if group:
-                return group
-
-    for name, ticker in TICKER_MAP.items():
-        if name.lower() in question.lower() and ticker:
-            return ticker
-
-    return None
-
-
 # ============================================================
-# DIRECT CALCULATION HANDLER
-# ============================================================
-
-def analyze_calculation_question(question: str) -> Optional[str]:
-    """Handle explicit calculation questions."""
-    q = question.lower()
-
-    # CAGR with explicit numbers
-    if "cagr" in q or "compound annual growth" in q:
-        nums = re.findall(r"\$?([\d,]+(?:\.\d+)?)", question)
-        if len(nums) >= 2:
-            try:
-                start = float(nums[0].replace(",", ""))
-                end = float(nums[1].replace(",", ""))
-                years_match = re.search(r"(\d+)\s+years?", q)
-                if years_match:
-                    years = int(years_match.group(1))
-                    cagr = FINANCIAL_FORMULAS["cagr"](start, end, years)
-                    if cagr is not None:
-                        return f"The CAGR from ${start:,.0f} to ${end:,.0f} over {years} years is {cagr}%."
-            except Exception:
-                pass
-
-    # P/E ratio
-    if re.search(r"p/?e ratio|price.to.earnings", q):
-        price_match = re.search(r"price of \$?([\d.]+)", q)
-        eps_match = re.search(r"earnings per share of \$?([\d.]+)", q)
-        if price_match and eps_match:
-            try:
-                price = float(price_match.group(1))
-                eps = float(eps_match.group(1))
-                pe = round(price / eps, 2)
-                return f"The P/E ratio is {pe}x. (Price ${price} / EPS ${eps} = {pe}x)"
-            except Exception:
-                pass
-
-    # Gross margin
-    if "gross margin" in q:
-        nums = re.findall(r"\$?([\d,]+(?:\.\d+)?)", question)
-        if len(nums) >= 2:
-            try:
-                revenue = float(nums[0].replace(",", ""))
-                cogs = float(nums[1].replace(",", ""))
-                gm = FINANCIAL_FORMULAS["gross_margin"](revenue, cogs)
-                if gm is not None:
-                    return f"The gross margin is {gm}%."
-            except Exception:
-                pass
-
-    return None
-
-
-# ============================================================
-# COMPREHENSIVE ANSWER BUILDER
-# ============================================================
-
-def build_financial_answer(question: str, context_data: Dict = None) -> str:
-    """Build a comprehensive financial answer."""
-    # Try direct calculation first
-    calc_answer = analyze_calculation_question(question)
-    if calc_answer:
-        return calc_answer
-
-    # Extract key info from question
-    company = extract_company_from_question(question)
-    fy = extract_year_from_question(question)
-    quarter = extract_quarter_from_question(question)
-
-    # Try EDGAR first if we have company + year
-    if company and fy:
-        edgar_answer = answer_from_edgar(question, company, fy, quarter)
-        if edgar_answer:
-            return edgar_answer
-
-    # Fall back to yfinance for current/recent data
-    ticker = extract_ticker(question)
-    if ticker and HAS_YFINANCE:
-        yf_data = fetch_yfinance_data(ticker)
-        if yf_data:
-            q_lower = question.lower()
-            parts = []
-
-            if any(kw in q_lower for kw in ["p/e", "pe ratio", "price to earnings"]):
-                pe = yf_data.get("pe_ratio")
-                if pe:
-                    parts.append(f"{yf_data.get('company_name', ticker)} trailing P/E: {pe:.2f}x")
-
-            if any(kw in q_lower for kw in ["revenue", "sales"]):
-                rev = yf_data.get("revenue_ttm")
-                if rev:
-                    parts.append(f"Revenue (TTM): ${rev/1e9:.2f}B")
-                growth = yf_data.get("revenue_growth")
-                if growth:
-                    parts.append(f"Revenue growth: {growth*100:.1f}%")
-
-            if any(kw in q_lower for kw in ["margin"]):
-                gm = yf_data.get("gross_margins")
-                om = yf_data.get("operating_margins")
-                if gm:
-                    parts.append(f"Gross margin: {gm*100:.1f}%")
-                if om:
-                    parts.append(f"Operating margin: {om*100:.1f}%")
-
-            if parts:
-                return ". ".join(parts) + "."
-
-    # Generate financial reasoning for complex qualitative questions
-    return generate_financial_reasoning(question, company, fy)
-
-
-def generate_financial_reasoning(question: str, company: str = None, fy: int = None) -> str:
-    """Generate financial reasoning for complex questions."""
-    q_lower = question.lower()
-    company_name = company or "the company"
-
-    # Domain-relevant question patterns
-    if any(kw in q_lower for kw in ["arpu", "average revenue per user"]):
-        return (
-            f"{company_name}'s average revenue per user (ARPU) trends reflect "
-            "pricing strategy, subscriber mix, geographic expansion, and product tier changes. "
-            "Growth in ad-supported tiers typically dilutes ARPU while expanding the addressable market. "
-            "Premium plan price increases boost ARPU but may reduce subscriber growth."
-        )
-
-    if any(kw in q_lower for kw in ["merger", "acquisition", "takeover"]):
-        companies_in_q = []
-        for name in COMPANY_CIK_MAP:
-            if name.lower() in q_lower:
-                companies_in_q.append(name)
-        if len(companies_in_q) >= 2:
-            return (
-                f"Regarding the {companies_in_q[0]}/{companies_in_q[1]} transaction: "
-                "M&A transactions typically impact business operations through synergy realization, "
-                "regulatory scrutiny, employee retention, and strategic repositioning. "
-                "The acquirer typically pays a control premium (20-30% above market) "
-                "while facing integration risks and potential regulatory blocks from the DOJ or FTC."
-            )
-
-    if any(kw in q_lower for kw in ["guidance", "outlook", "forecast"]):
-        return (
-            "Company guidance reflects management's confidence interval based on "
-            "backlog visibility, macro conditions, and internal execution visibility. "
-            "Guidance ranges typically account for macro uncertainty, competitive dynamics, "
-            "and seasonal patterns. Narrower ranges indicate higher business visibility."
-        )
-
-    if any(kw in q_lower for kw in ["board", "director", "nominated", "appointed"]):
-        return (
-            "Board appointments are disclosed in company proxy statements (DEF 14A) "
-            "and 8-K current reports. New directors typically bring relevant industry expertise, "
-            "financial acumen, or shareholder perspective to governance. "
-            "Independent directors must meet NYSE/NASDAQ independence criteria."
-        )
-
-    if any(kw in q_lower for kw in ["restructuring", "charges", "impairment"]):
-        return (
-            "Restructuring charges represent costs associated with business reorganization, "
-            "facility closures, or workforce reductions. These are typically disclosed as "
-            "separate line items in the income statement and detailed in footnotes. "
-            "Non-recurring charges are excluded from adjusted/non-GAAP earnings."
-        )
-
-    if any(kw in q_lower for kw in ["dividend", "distribution"]):
-        return (
-            "Dividend distributions are disclosed in the statement of cash flows under "
-            "financing activities. Companies with consistent dividend growth demonstrate "
-            "financial stability and commitment to shareholder returns. Dividend aristocrats "
-            "have increased dividends for 25+ consecutive years."
-        )
-
-    if any(kw in q_lower for kw in ["debt", "borrowing", "credit"]):
-        return (
-            f"{company_name}'s debt profile is best evaluated through long-term debt obligations, "
-            "credit facility availability, debt maturity schedule, and interest coverage ratio. "
-            "Strong free cash flow generation provides flexibility for debt repayment and investment."
-        )
-
-    if any(kw in q_lower for kw in ["beat", "miss", "exceeded", "fell short", "surpassed"]):
-        bps_match = re.search(r"(\d+)\s*bps?\s*(beat|miss|above|below)", q_lower)
-        if bps_match:
-            bps = int(bps_match.group(1))
-            direction = "beat" if bps_match.group(2) in ["beat", "above"] else "miss"
-            return f"The result was a {bps} basis points (bps) {direction} versus consensus/guidance."
-        return (
-            "Based on earnings releases, companies that beat guidance typically see "
-            "positive stock reactions, while misses often lead to downward guidance revision. "
-            "Margins versus guidance midpoint provide the most precise comparison."
-        )
-
-    if any(kw in q_lower for kw in ["capital-intensive", "capital intensive"]):
-        return (
-            "Capital intensity is measured by CAPEX/Revenue ratio, Fixed Assets/Total Assets, "
-            "and Return on Assets. Companies with CAPEX/Revenue > 10% are generally "
-            "considered capital-intensive (e.g., utilities, telecom, manufacturing). "
-            "Technology and software companies typically have CAPEX/Revenue < 5%."
-        )
-
-    # Fallback: Try to get any available data from EDGAR
-    if company and fy:
-        cik = get_cik(company)
-        if cik:
-            facts = fetch_edgar_facts(cik)
-            if facts:
-                company_name = facts.get("company", company)
-                rev = None
-                result = get_metric_value(facts, XBRL_METRICS["revenue"], fiscal_year=fy)
-                if result:
-                    rev = result[0]
-                ni = None
-                result2 = get_metric_value(facts, XBRL_METRICS["net_income"], fiscal_year=fy)
-                if result2:
-                    ni = result2[0]
-
-                if rev:
-                    parts = [f"{company_name} FY{fy}:"]
-                    parts.append(f"Revenue: ${rev/1e9:.2f}B")
-                    if ni:
-                        margin = (ni / rev) * 100
-                        parts.append(f"Net income: ${ni/1e9:.2f}B ({margin:.1f}% margin)")
-                    return " | ".join(parts) + "."
-
-    return (
-        "Financial analysis requires examination of the company's SEC filings. "
-        "Key performance indicators include revenue growth, margin trends, "
-        "EPS trajectory, and cash flow generation. "
-        "For precise figures, refer to the company's latest earnings release "
-        "or 10-K/10-Q filing on SEC EDGAR (edgar.sec.gov)."
-    )
-
-
-# ============================================================
-# A2A GENERATE ENDPOINT HANDLER
-# ============================================================
-
-def handle_generate_request(
-    task_id: int,
-    question: str,
-    gold_answer: Optional[str] = None,
-    rubric: Optional[List[Dict]] = None,
-    difficulty_level: str = "Unknown",
-    question_type: str = "Unknown",
-    candidate_answer: Optional[str] = None,
-) -> str:
-    """
-    Handle the /a2a/generate request from the green agent evaluator.
-    Returns a financial answer for the given question.
-    """
-    log.info(f"Task {task_id}: type={question_type}, diff={difficulty_level}")
-    log.info(f"Q: {question[:150]}")
-
-    if candidate_answer:
-        return candidate_answer
-
-    start_time = time.time()
-    answer = build_financial_answer(question)
-    elapsed = time.time() - start_time
-
-    log.info(f"Answer ({elapsed:.2f}s): {answer[:200]}")
-    return answer
-
-
-# ============================================================
-# FASTAPI APP
+# FASTAPI SERVER
 # ============================================================
 
 if HAS_FASTAPI:
     app = FastAPI(
         title="AutoPilotAI Finance Agent",
-        description="A2A compliant finance agent with SEC EDGAR + FinanceBench integration",
+        description="OfficeQA-compatible US Treasury Bulletin analysis agent for AgentBeats",
         version=AGENT_VERSION
     )
 
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
-        allow_credentials=True,
         allow_methods=["*"],
-        allow_headers=["*"],
+        allow_headers=["*"]
     )
-
-    AGENT_CARD = {
-        "name": "AutoPilotAI Finance Agent",
-        "description": (
-            "Autonomous finance agent with SEC EDGAR XBRL integration, "
-            "FinanceBench Q&A, real-time market data via yfinance, "
-            "financial calculations, and agent economy analytics."
-        ),
-        "version": AGENT_VERSION,
-        "url": "https://agentbeats-finance.chitacloud.dev",
-        "capabilities": {
-            "streaming": False,
-            "pushNotifications": False,
-            "stateTransitionHistory": False
-        },
-        "defaultInputModes": ["text"],
-        "defaultOutputModes": ["text"],
-        "skills": [
-            {
-                "id": "financebench-qa",
-                "name": "FinanceBench Q&A",
-                "description": "Answer financial questions from SEC EDGAR XBRL data (10-K/10-Q filings)",
-                "tags": ["finance", "sec", "edgar", "xbrl", "earnings"],
-                "examples": [
-                    "What is the FY2018 capital expenditure for 3M?",
-                    "What is AMD's FY2022 revenue?",
-                    "Is 3M capital-intensive based on FY2022 data?"
-                ]
-            },
-            {
-                "id": "financial-calculations",
-                "name": "Financial Calculations",
-                "description": "Calculate P/E, CAGR, margins, ROA, ROE, and other ratios",
-                "tags": ["calculations", "metrics", "ratios"],
-            },
-            {
-                "id": "market-data",
-                "name": "Live Market Data",
-                "description": "Real-time stock prices and financial metrics via yfinance",
-                "tags": ["market", "realtime", "stocks"],
-            }
-        ]
-    }
-
-    @app.get("/.well-known/agent.json")
-    async def agent_card():
-        return AGENT_CARD
 
     @app.get("/health")
     async def health():
         return {
-            "status": "healthy",
+            "status": "ok",
             "agent": AGENT_ID,
             "version": AGENT_VERSION,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "yfinance": HAS_YFINANCE,
-            "edgar": True,
+            "llm_available": HAS_LITELLM and bool(LLM_API_KEY),
+            "timestamp": datetime.now(timezone.utc).isoformat()
         }
+
+    @app.get("/.well-known/agent.json")
+    async def agent_card():
+        return JSONResponse(content=AGENT_CARD)
 
     @app.post("/a2a/generate")
-    async def generate(request: Request):
-        body = await request.json()
-        answer = handle_generate_request(
-            task_id=body.get("task_id", 0),
-            question=body.get("question", ""),
-            gold_answer=body.get("gold_answer"),
-            rubric=body.get("rubric"),
-            difficulty_level=body.get("difficulty_level", "Unknown"),
-            question_type=body.get("question_type", "Unknown"),
-            candidate_answer=body.get("candidate_answer"),
-        )
-        return {
-            "task_id": body.get("task_id", 0),
-            "answer": answer,
-            "mode": "llm",
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-        }
+    async def a2a_generate(request: Request):
+        """Main A2A evaluation endpoint."""
+        try:
+            body = await request.json()
+            log.info(f"A2A generate request: {str(body)[:200]}")
 
-    @app.get("/a2a/status")
-    async def a2a_status():
-        return {
-            "status": "ready",
-            "agent_id": AGENT_ID,
-            "version": AGENT_VERSION,
-            "capabilities": ["financebench-qa", "financial-calculations", "market-data"],
-        }
+            question, source_docs = parse_a2a_task(body)
+
+            if not question:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "No question found in request"}
+                )
+
+            # Process the finance question
+            answer = process_finance_question(question, source_docs)
+
+            task_id = body.get("id", str(uuid.uuid4()))
+            response = format_a2a_response(answer, task_id)
+
+            log.info(f"Returning answer: {answer[:100]}")
+            return JSONResponse(content=response)
+
+        except Exception as e:
+            log.error(f"Error in a2a_generate: {e}", exc_info=True)
+            return JSONResponse(
+                status_code=500,
+                content={"error": str(e)}
+            )
 
     @app.post("/")
-    async def a2a_jsonrpc(request: Request):
-        body = await request.json()
-        method = body.get("method", "")
-        params = body.get("params", {})
-        rpc_id = body.get("id")
+    async def root_handler(request: Request):
+        """JSON-RPC fallback handler."""
+        try:
+            body = await request.json()
+            method = body.get("method", "")
+            log.info(f"Root handler: method={method}")
 
-        if method in ["tasks/send", "tasks/sendSubscribe"]:
-            message = params.get("message", {})
-            parts = message.get("parts", [])
-            question = ""
-            for p in parts:
-                if p.get("type") == "text":
-                    question = p.get("text", "")
-                    break
-            if not question:
-                question = params.get("text", params.get("query", ""))
+            if method in ["tasks/send", "task/send", "generate", "execute"]:
+                return await a2a_generate(request)
 
-            answer = build_financial_answer(question)
-            return {
-                "jsonrpc": "2.0",
-                "id": rpc_id,
-                "result": {
-                    "id": str(uuid.uuid4()),
-                    "status": "completed",
-                    "result": {
-                        "parts": [{"type": "text", "text": answer}]
-                    }
-                }
-            }
+            # Default: try to process as a task
+            return await a2a_generate(request)
 
-        return JSONResponse(
-            status_code=400,
-            content={"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32601, "message": f"Method not found: {method}"}}
-        )
+        except Exception as e:
+            log.error(f"Root handler error: {e}")
+            return JSONResponse(
+                status_code=500,
+                content={"error": str(e)}
+            )
 
-    @app.post("/analyze")
-    async def analyze(request: Request):
-        body = await request.json()
-        question = body.get("query", body.get("message", body.get("question", "")))
-        answer = build_financial_answer(question)
-        return {"answer": answer, "agent": AGENT_ID}
-
-    @app.get("/capabilities")
-    async def capabilities():
+    @app.get("/")
+    async def root_get():
         return {
-            "supported_tasks": ["financebench-qa", "financial-calculations", "market-data"],
-            "a2a_version": "0.2.6",
-            "agent_id": AGENT_ID,
-            "edgar_integration": True,
-            "yfinance_enabled": HAS_YFINANCE,
+            "name": "AutoPilotAI Finance Agent",
+            "version": AGENT_VERSION,
+            "benchmark": "OfficeQA - US Treasury Bulletins",
+            "endpoints": {
+                "task": "POST /a2a/generate",
+                "card": "GET /.well-known/agent.json",
+                "health": "GET /health"
+            }
         }
 
 
 # ============================================================
-# FALLBACK HTTP SERVER
+# MAIN ENTRYPOINT
 # ============================================================
 
-else:
-    from http.server import HTTPServer, BaseHTTPRequestHandler
+if __name__ == "__main__":
+    import argparse
 
-    class A2AHandler(BaseHTTPRequestHandler):
-        def log_message(self, fmt, *args):
-            log.info(f"HTTP {self.address_string()} - {fmt % args}")
+    parser = argparse.ArgumentParser(description="AutoPilotAI Finance Agent v3.0")
+    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
+    parser.add_argument("--port", type=int, default=PORT, help="Port to listen on")
+    parser.add_argument("--card-url", default="", help="Public URL for agent card")
+    args = parser.parse_args()
 
-        def send_json(self, code: int, data: Dict):
-            body = json.dumps(data, indent=2).encode()
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(body)
+    if args.card_url:
+        AGENT_CARD["url"] = args.card_url
 
-        def do_GET(self):
-            path = self.path.split("?")[0]
-            if path == "/.well-known/agent.json":
-                self.send_json(200, {
-                    "name": "AutoPilotAI Finance Agent",
-                    "version": AGENT_VERSION,
-                    "url": "https://agentbeats-finance.chitacloud.dev",
-                })
-            elif path == "/health":
-                self.send_json(200, {
-                    "status": "healthy",
-                    "agent": AGENT_ID,
-                    "version": AGENT_VERSION,
-                })
-            else:
-                self.send_json(404, {"error": "Not found"})
-
-        def do_POST(self):
-            path = self.path.split("?")[0]
-            content_length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(content_length) if content_length > 0 else b"{}"
-            try:
-                payload = json.loads(body)
-            except Exception:
-                self.send_json(400, {"error": "Invalid JSON"})
-                return
-
-            if path == "/a2a/generate":
-                answer = handle_generate_request(
-                    task_id=payload.get("task_id", 0),
-                    question=payload.get("question", ""),
-                    difficulty_level=payload.get("difficulty_level", "Unknown"),
-                    question_type=payload.get("question_type", "Unknown"),
-                )
-                self.send_json(200, {
-                    "task_id": payload.get("task_id", 0),
-                    "answer": answer,
-                    "mode": "llm",
-                    "generated_at": datetime.now(timezone.utc).isoformat(),
-                })
-            elif path == "/":
-                question = ""
-                params = payload.get("params", {})
-                message = params.get("message", {})
-                parts = message.get("parts", [])
-                for p in parts:
-                    if p.get("type") == "text":
-                        question = p.get("text", "")
-                        break
-                answer = build_financial_answer(question)
-                self.send_json(200, {
-                    "jsonrpc": "2.0",
-                    "id": payload.get("id"),
-                    "result": {
-                        "id": str(uuid.uuid4()),
-                        "status": "completed",
-                        "result": {"parts": [{"type": "text", "text": answer}]}
-                    }
-                })
-            else:
-                self.send_json(404, {"error": "Not found"})
-
-        def do_OPTIONS(self):
-            self.send_response(200)
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
-            self.end_headers()
-
-
-def main():
-    log.info(f"Starting AutoPilotAI Finance Agent v{AGENT_VERSION} on port {PORT}")
-    log.info(f"FastAPI: {HAS_FASTAPI}, yfinance: {HAS_YFINANCE}")
+    log.info(f"Starting AutoPilotAI Finance Agent v{AGENT_VERSION}")
+    log.info(f"Benchmark: OfficeQA - US Treasury Bulletins (1939-2025)")
+    log.info(f"LLM available: {HAS_LITELLM and bool(LLM_API_KEY)}")
+    log.info(f"Listening on {args.host}:{args.port}")
 
     if HAS_FASTAPI:
-        uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
+        uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     else:
-        server = HTTPServer(("0.0.0.0", PORT), A2AHandler)
-        server.serve_forever()
-
-
-if __name__ == "__main__":
-    main()
+        log.error("FastAPI not available. Cannot start server.")
+        import sys
+        sys.exit(1)
