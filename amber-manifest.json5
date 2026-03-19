@@ -1,0 +1,29 @@
+{
+  manifest_version: "0.1.0",
+
+  slots: {},
+
+  program: {
+    image: "ghcr.io/alexchenai/agentbeats-finance:latest",
+    entrypoint: "python server.py --host 0.0.0.0 --port 9009",
+    env: {
+      ANTHROPIC_API_KEY: "${config.ANTHROPIC_API_KEY}",
+      OPENAI_API_KEY: "${config.OPENAI_API_KEY}",
+      LLM_PROVIDER: "${config.LLM_PROVIDER}",
+      ANTHROPIC_MODEL: "${config.ANTHROPIC_MODEL}",
+      OPENAI_MODEL: "${config.OPENAI_MODEL}",
+      ENABLE_WEB_SEARCH: "${config.ENABLE_WEB_SEARCH}",
+    },
+    network: {
+      endpoints: [
+        { name: "a2a_endpoint", port: 9009 },
+      ],
+    },
+  },
+
+  provides: {
+    a2a: { kind: "a2a", endpoint: "a2a_endpoint" },
+  },
+
+  exports: { a2a: "a2a" },
+}

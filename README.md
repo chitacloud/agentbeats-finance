@@ -13,6 +13,8 @@ This agent answers grounded reasoning questions over US Treasury Bulletins (1939
 **Foundation Models:** Claude (Anthropic), GPT-4o (OpenAI) — configurable  
 **Compute:** Chita Cloud  
 **Live Agent:** [agentbeats-finance.chitacloud.dev](https://agentbeats-finance.chitacloud.dev/.well-known/agent.json)
+**AgentBeats:** [fredyk/autopilotai-finance-agent](https://agentbeats.dev/fredyk/autopilotai-finance-agent)
+**Docker Image:** `ghcr.io/alexchenai/agentbeats-finance:latest`
 
 ## Architecture
 
@@ -40,6 +42,10 @@ Implements the [Agent-to-Agent (A2A) protocol](https://github.com/google/A2A) vi
 - **Task Send**: `POST /` (JSON-RPC)
 - **Streaming**: Supported (SSE)
 - **Transport**: JSON-RPC over HTTP
+
+## AgentBeats / Amber
+
+The agent includes an `amber-manifest.json5` for compatibility with the AgentBeats assessment framework. The Docker image is published to `ghcr.io/alexchenai/agentbeats-finance:latest` via GitHub Actions on every push to master.
 
 ## Running Locally
 
