@@ -76,7 +76,8 @@ def main():
 
     log.info(f"Starting AutoPilotAI Finance Agent v4.0 on {args.host}:{args.port}")
     log.info(f"Benchmark: OfficeQA - US Treasury Bulletins (1939-2025)")
-    log.info(f"Card URL: {args.card_url or \"https://agentbeats-finance.chitacloud.dev/\"}")
+    card_url = args.card_url or "https://agentbeats-finance.chitacloud.dev/"
+    log.info(f"Card URL: {card_url}")
     uvicorn.run(server.build(), host=args.host, port=args.port, timeout_keep_alive=300)
 
 
