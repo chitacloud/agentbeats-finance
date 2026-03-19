@@ -345,7 +345,7 @@ def proxy_to_live_service(question: str) -> Optional[str]:
             "Content-Type": "application/json",
             "User-Agent": "AutoPilotAI-Proxy/4.0",
         }
-        proxy_timeout = int(os.environ.get("PROXY_TIMEOUT", "5"))
+        proxy_timeout = int(os.environ.get("PROXY_TIMEOUT", "30"))
         req = urllib.request.Request(f"{PROXY_URL}/", data=payload, headers=headers, method="POST")
         with urllib.request.urlopen(req, timeout=proxy_timeout) as resp:
             result = json.loads(resp.read().decode("utf-8"))
