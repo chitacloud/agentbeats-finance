@@ -4,7 +4,7 @@
   slots: {},
 
   program: {
-    image: "ghcr.io/alexchenai/agentbeats-finance:latest",
+    image: "ghcr.io/chitacloud/agentbeats-finance:latest",
     entrypoint: "python server.py --host 0.0.0.0 --port 9009",
     env: {
       ANTHROPIC_API_KEY: "${config.ANTHROPIC_API_KEY}",
